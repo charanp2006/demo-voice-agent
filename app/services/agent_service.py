@@ -26,7 +26,7 @@ Return raw JSON only when action is required.
 Do not wrap JSON in markdown.
 """
 
-def procces_message(user_message: str):
+def process_message(user_message: str):
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",

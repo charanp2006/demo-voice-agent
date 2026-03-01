@@ -99,6 +99,42 @@ FastAPI App
 8️⃣ Return JSON response to client:
    {"response": "Your appointment is booked for March 1st at 3:00 PM."}
 ```
+---
+---
+---
+
+```
+User sends audio
+↓
+Groq Whisper → text
+↓
+Gemini → reasoning + JSON routing
+↓
+Backend executes tool
+↓
+Gemini returns response text
+↓
+gTTS converts text → audio file
+↓
+Return audio file to user
+```
+
+---
+```
+User speaks
+↓
+Groq Whisper (STT)
+↓
+Gemini 2.5 Flash (Agent logic)
+↓
+FastAPI executes tool
+↓
+Gemini generates response text
+↓
+gTTS converts to speech
+↓
+Return audio file
+```
 
 ---
 ### ADD-ONs 
