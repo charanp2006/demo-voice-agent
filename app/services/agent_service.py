@@ -3,21 +3,33 @@ import os
 # from openai import OpenAI
 from google import genai
 from dotenv import load_dotenv
-from app.routers.clinic import check_slots, book_appointment
+from app.routers.clinic import check_slots, book_appointment, cancel_appointment
+from datetime import datetime
 
 # load .env variables
 load_dotenv()
 
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
+today = datetime.now().strftime("%Y-%m-%d")
+
 SYSTEM_PROMPT = """
 You are a dental clinic receptionist.
+
 
 If user asks wants to:
 - Check appointment slots → respond ONLY in JSON:
   { "action": "check_slots", "date": "YYYY-MM-DD" }
 
-- Book appointment → respond ONLY in JSON:
+- Book appointment 
+session_id: 123
+current_intent: "book"
+collected_fields:
+   date: 2026-03-10
+   time: 5 PM
+   name: None
+   phone: None
+   → respond ONLY in JSON:
   { "action": "book", "name": "...", "phone": "...", "date": "YYYY-MM-DD", "time": "..." }
 
 If it is general information, respond normally in plain text.
@@ -45,6 +57,12 @@ def process_message(user_message: str):
         elif data["action"] == "book":
             result = book_appointment(data)
             return f"Appointment booked successfully for date {data['date']} at {data['time']}."
+        
+        elif data["action"] == "cancel":
+            result = cancel_appointment(data)
+            if "error" in result:
+                return result["error"]
+            return "Your appointment has been cancelled successfully."
 
     except Exception:
         # If JSON parsing fails, it means it's a general response, so we return it as is.
