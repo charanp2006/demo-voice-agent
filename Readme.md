@@ -5,6 +5,7 @@ An intelligent AI assistant that handles appointment booking via voice and chat 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Complete Application Flow](#complete-application-flow)
 - [System Architecture](#system-architecture)
 - [Request Flow](#request-flow)
 - [Voice Processing](#voice-processing)
@@ -24,12 +25,63 @@ This application provides a conversational AI interface for a dental clinic that
 
 ---
 
+## Complete Application Flow
+
+### End-to-End Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as FastAPI /chat
+    participant Agent as agent_service
+    participant LLM as llm_service
+    participant Clinic as clinic_service
+    participant Voice as voice_service
+
+    Note over U,Voice: Chat-Based Appointment Booking
+    U->>API: POST /chat {message: "Book appointment tomorrow at 3pm"}
+    API->>Agent: process_message(message)
+    Agent->>LLM: send_to_llm(message, tools)
+    LLM->>LLM: Analyze intent + available tools
+    
+    alt Tool Call Required
+        LLM->>Agent: tool_call: check_slots(date="2026-03-04")
+        Agent->>Clinic: check_slots(date)
+        Clinic-->>Agent: {available_slots: ["9am", "3pm", "5pm"]}
+        Agent->>LLM: Send tool result
+        LLM->>Agent: tool_call: book_appointment({...})
+        Agent->>Clinic: book_appointment(name, phone, date, time)
+        Clinic-->>Agent: {success: true, appointment_id: 123}
+        Agent->>LLM: Send booking result
+        LLM-->>Agent: "Your appointment is confirmed for March 4 at 3pm"
+    else Direct Response
+        LLM-->>Agent: Direct answer (no tools needed)
+    end
+    
+    Agent-->>API: {response: "..."}
+    API-->>U: JSON Response
+
+    Note over U,Voice: Voice-Based Interaction
+    U->>Voice: Audio input (speech)
+    Voice->>Voice: Groq Whisper (STT)
+    Voice->>Agent: Transcribed text
+    Agent->>LLM: Process with tools
+    LLM->>Clinic: Execute tool functions
+    Clinic-->>LLM: Return results
+    LLM-->>Agent: Natural language response
+    Agent->>Voice: Response text
+    Voice->>Voice: gTTS (TTS)
+    Voice-->>U: Audio output
+```
+
+---
+
 ## System Architecture
 
 ### Core Components
 
 ```mermaid
-graph TD
+graph LR
     A["User<br/>(Voice/Chat)"]
     B["voice_service<br/>(Speech-to-Text)"]
     C["agent_service<br/>(AI Decision Making)"]
@@ -38,19 +90,13 @@ graph TD
     F["Response<br/>(Confirmation)"]
     G["voice_service<br/>(Text-to-Speech)"]
     
-    A --> B
-    B --> C
-    C --> D
-    D --> E
-    E --> F
-    F --> G
-    G --> A
+    A --> B --> C --> D --> E --> F --> G --> A
 ```
 
 ### Tool-Based Agent Pattern
 
 ```mermaid
-graph TD
+graph LR
     A["User Message"]
     B["agent_service"]
     C["LLM<br/>(with tools)"]
@@ -58,12 +104,9 @@ graph TD
     E["Execute Python<br/>Function"]
     F["Return Result<br/>to User"]
     
-    A --> B
-    B --> C
-    C --> D
-    D -->|Yes| E
+    A --> B --> C --> D
+    D -->|Yes| E --> F
     D -->|No| F
-    E --> F
 ```
 
 ---
@@ -73,36 +116,25 @@ graph TD
 ### REST API Workflow
 
 ```mermaid
-graph TD
-    A["Client Request<br/>POST /chat<br/>{message: ...}"]
-    B["FastAPI Endpoint<br/>/chat"]
-    C["Pydantic Validation<br/>ChatRequest"]
-    D["process_message<br/>user_message"]
-    E["Send to AI Model<br/>+ System Prompt<br/>+ Available Tools"]
-    F{"AI Decision"}
-    G["Skip Tools<br/>Respond Directly"]
-    H["Generate Tool Call<br/>check_slots or<br/>book_appointment"]
-    I["Execute Python<br/>Function"]
-    J["Receive Result<br/>Python Dict"]
-    K["Second Request to AI<br/>+ Original Message<br/>+ Tool Result"]
-    L["AI Generates<br/>Natural Language Reply"]
-    M["HTTP Response<br/>JSON"]
-    N["Client Receives<br/>Response"]
+graph LR
+    A["Client Request<br/>POST /chat"]
+    B["FastAPI<br/>Endpoint"]
+    C["Pydantic<br/>Validation"]
+    D["process_<br/>message"]
+    E["Send to AI<br/>+ Tools"]
+    F{"AI<br/>Decision"}
+    G["Direct<br/>Response"]
+    H["Tool<br/>Call"]
+    I["Execute<br/>Function"]
+    J["Result<br/>Dict"]
+    K["Second<br/>AI Call"]
+    L["Final<br/>Reply"]
+    M["HTTP<br/>Response"]
     
-    A --> B
-    B --> C
-    C --> D
-    D --> E
-    E --> F
-    F -->|Direct Response| G
-    F -->|Tool Needed| H
-    G --> L
-    H --> I
-    I --> J
-    J --> K
-    K --> L
+    A --> B --> C --> D --> E --> F
+    F -->|Direct| G --> L
+    F -->|Tool| H --> I --> J --> K --> L
     L --> M
-    M --> N
 ```
 
 ---
@@ -112,23 +144,16 @@ graph TD
 ### Voice-Only Workflow
 
 ```mermaid
-graph TD
-    A["User Speaks"]
-    B["Groq Whisper<br/>(Speech-to-Text)"]
-    C["Gemini 2.5 Flash<br/>(Agent Logic)"]
-    D["AI Decision"]
-    E["FastAPI Executes<br/>Tool(s)"]
-    F["Gemini Generates<br/>Response Text"]
-    G["gTTS Converts<br/>to Speech"]
-    H["Return Audio<br/>to User"]
+graph LR
+    A["User<br/>Speaks"]
+    B["Groq Whisper<br/>(STT)"]
+    C["Gemini 2.5<br/>(Agent Logic)"]
+    D["FastAPI<br/>Execute Tools"]
+    E["Gemini<br/>Response"]
+    F["gTTS<br/>(TTS)"]
+    G["Audio<br/>Output"]
     
-    A --> B
-    B --> C
-    C --> D
-    D --> E
-    E --> F
-    F --> G
-    G --> H
+    A --> B --> C --> D --> E --> F --> G
 ```
 
 ---
@@ -138,17 +163,17 @@ graph TD
 For real-time, streaming interactions:
 
 ```mermaid
-graph TB
+graph LR
     subgraph Client["Browser Client"]
-        A1["Audio Chunks"]
-        A2["STT Stream"]
-        A3["TTS Stream"]
+        A1["Audio<br/>Chunks"]
+        A2["STT<br/>Stream"]
+        A3["TTS<br/>Stream"]
     end
     
     subgraph Server["FastAPI Server"]
-        B1["Partial Transcript"]
-        B2["LLM Stream"]
-        B3["Audio Chunks"]
+        B1["Partial<br/>Transcript"]
+        B2["LLM<br/>Stream"]
+        B3["Audio<br/>Chunks"]
     end
     
     A1 <-->|WebSocket| B1

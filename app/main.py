@@ -33,6 +33,18 @@ async def test_stt(file: UploadFile = File(...)):
     text = transcribe_audio(file_location)
     return {"transcription": text}
 
+
+# --- Test TTS Endpoint --- #
+@app.post("/test-tts")
+async def test_tts(request: ChatRequest):
+    
+    # Generate audio from text
+    temp_output = "test_tts_output.mp3"
+    text_to_speech(request.message, temp_output)
+    
+    return FileResponse(temp_output, media_type="audio/mpeg")
+
+
 @app.post("/voice")
 async def voice_endpoint(file: UploadFile = File(...)):
 

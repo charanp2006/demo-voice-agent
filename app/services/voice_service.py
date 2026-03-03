@@ -22,13 +22,19 @@ def text_to_speech(text: str, output_path: str):
 
     try:
         # Try using ElevenLabs first
-        audio_content = eleven_client.text_to_speech.convert(
+        audio_generator = eleven_client.text_to_speech.convert(
             text=text,
-            voice="Rachel",
-            model="eleven_monolingual_v1"
-            # voice_id="EXAVITQu4vr4xnSDxMaL",  # Default Eleven voice
-            # model_id="eleven_monolingual_v1"
+            # voice_id="SAz9YHcvj6GT2YYXdXww",  # River - Relaxed, Neutral, Informative
+            voice_id="IKne3meq5aSn9XLyUdCD",  # Charlie - Deep, Confident, Energetic
+            model_id="eleven_turbo_v2"
+            
+            # Other male voice options:
+            # voice_id="cjVigY5qzO86Huf0OWal",  # Eric - Smooth, Trustworthy
+            # voice_id="nPczCjzI2devNBz1zQrb",  # Brian - Deep, Resonant and Comforting
+            # voice_id="IKne3meq5aSn9XLyUdCD",  # Charlie - Deep, Confident, Energetic
         )
+        # Convert generator to bytes
+        audio_content = b"".join(audio_generator)
         with open(output_path, "wb") as audio_file:
             audio_file.write(audio_content)
 
@@ -37,6 +43,23 @@ def text_to_speech(text: str, output_path: str):
     except Exception as e:
         print(f"ElevenLabs TTS failed: {e}. Falling back to gTTS.")
 
-        tts = gTTS(text=text, lang='en')
-        tts.save(output_path)
-    # return output_path
+        # tts = gTTS(text=text, lang='en')
+        # tts.save(output_path)
+    return output_path
+
+
+def get_available_voices():
+    """Get all available voices from ElevenLabs"""
+    try:
+        voices = eleven_client.voices.get_all()
+        voice_list = []
+        for voice in voices.voices:
+            voice_list.append({
+                "name": voice.name,
+                "voice_id": voice.voice_id
+            })
+            print(f"{voice.name}: {voice.voice_id}")
+        return voice_list
+    except Exception as e:
+        print(f"Error fetching voices: {e}")
+        return []
