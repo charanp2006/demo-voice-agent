@@ -23,6 +23,42 @@ This application provides a conversational AI interface for a dental clinic that
 - **Voice-based interactions** with speech-to-text and text-to-speech
 - **Multi-channel communication** via REST API and WebSocket
 
+### Web Frontend (Current)
+
+A React frontend app is available in `frontend/` with:
+- Start/stop microphone controls
+- Chat history panel (loaded from backend)
+- Loading indicator during voice processing
+- Audio playback of assistant responses
+
+Run frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Run backend (separate terminal):
+
+```bash
+uvicorn app.main:app --reload
+```
+
+`POST /voice` now returns JSON:
+
+```json
+{
+    "transcription": "...",
+    "response": "...",
+    "audio_url": "/audio/response_xxx.mp3"
+}
+```
+
+Frontend flow:
+
+`Mic → POST /voice → STT → Agent → DB → TTS → JSON(audio_url) → Play audio + update chat panel`
+
 ---
 
 ## Complete Application Flow
