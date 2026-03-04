@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { LoaderCircle, Mic, Send, Square } from 'lucide-react';
+import { LoaderCircle, Mic, Send, Square, ChevronDown, ChevronUp } from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 const WS_BASE = API_BASE.replace(/^http/i, 'ws');
@@ -17,6 +17,27 @@ export default function App() {
   const [chunkAckCount, setChunkAckCount] = useState(0);
   const [lastWsEvent, setLastWsEvent] = useState('-');
   const [wsTimeline, setWsTimeline] = useState([]);
+  const [showDebugPanel, setShowDebugPanel] = useState(true);
+  
+  // Latency tracking
+  const [latencies, setLatencies] = useState({
+    networkLatency: '-',
+    sttLatency: '-',
+    llmLatency: '-',
+    ttsLatency: '-',
+    totalLatency: '-',
+    audioRecordingDuration: '-',
+  });
+  
+  // Debug metrics
+  const [debugMetrics, setDebugMetrics] = useState({
+    audioSize: '-',
+    audioSamples: 0,
+    wsMessageCount: 0,
+    lastError: '-',
+    conversationStartTime: null,
+    totalTurns: 0,
+  });
 
   const mediaRecorderRef = useRef(null);
   const chatRef = useRef(null);
@@ -24,6 +45,15 @@ export default function App() {
   const audioObjectUrlRef = useRef(null);
   const wsRef = useRef(null);
   const conversationActiveRef = useRef(false);
+  
+  // Timestamp refs for latency calculation
+  const recordingStartTimeRef = useRef(null);
+  const recordingStopTimeRef = useRef(null);
+  const audioSentTimeRef = useRef(null);
+  const transcriptionReceivedTimeRef = useRef(null);
+  const agentTextReceivedTimeRef = useRef(null);
+  const audioReadyReceivedTimeRef = useRef(null);
+  const connectionStartTimeRef = useRef(null);
 
   useEffect(() => {
     loadHistory();
@@ -78,6 +108,42 @@ export default function App() {
     audioObjectUrlRef.current = objectUrl;
     audioRef.current.src = objectUrl;
     await audioRef.current.play().catch(() => null);
+  }
+
+  function calculateLatencies() {
+    const newLatencies = { ...latencies };
+    
+    // Network latency: From audio sent to first response (transcription)
+    if (audioSentTimeRef.current && transcriptionReceivedTimeRef.current) {
+      newLatencies.networkLatency = `${(transcriptionReceivedTimeRef.current - audioSentTimeRef.current).toFixed(0)}ms`;
+    }
+    
+    // STT latency: From audio sent to transcription received
+    if (audioSentTimeRef.current && transcriptionReceivedTimeRef.current) {
+      newLatencies.sttLatency = `${(transcriptionReceivedTimeRef.current - audioSentTimeRef.current).toFixed(0)}ms`;
+    }
+    
+    // LLM latency: From transcription received to agent text received
+    if (transcriptionReceivedTimeRef.current && agentTextReceivedTimeRef.current) {
+      newLatencies.llmLatency = `${(agentTextReceivedTimeRef.current - transcriptionReceivedTimeRef.current).toFixed(0)}ms`;
+    }
+    
+    // TTS latency: From agent text received to audio ready
+    if (agentTextReceivedTimeRef.current && audioReadyReceivedTimeRef.current) {
+      newLatencies.ttsLatency = `${(audioReadyReceivedTimeRef.current - agentTextReceivedTimeRef.current).toFixed(0)}ms`;
+    }
+    
+    // Total latency: From audio sent to audio ready
+    if (audioSentTimeRef.current && audioReadyReceivedTimeRef.current) {
+      newLatencies.totalLatency = `${(audioReadyReceivedTimeRef.current - audioSentTimeRef.current).toFixed(0)}ms`;
+    }
+    
+    // Recording duration
+    if (recordingStartTimeRef.current && recordingStopTimeRef.current) {
+      newLatencies.audioRecordingDuration = `${(recordingStopTimeRef.current - recordingStartTimeRef.current).toFixed(0)}ms`;
+    }
+    
+    setLatencies(newLatencies);
   }
 
   async function sendTextMessage() {
@@ -144,6 +210,7 @@ export default function App() {
       const recordedChunks = [];
       setChunkSentCount(0);
       setChunkAckCount(0);
+      recordingStartTimeRef.current = Date.now();
       trackWsEvent('recording_started');
 
       mediaRecorder.ondataavailable = (event) => {
@@ -170,6 +237,7 @@ export default function App() {
 
     const recorder = mediaRecorderRef.current;
     const recordedChunks = recorder.recordedChunks || [];
+    recordingStopTimeRef.current = Date.now();
     
     recorder.stop();
     recorder.stream?.getTracks()?.forEach((track) => track.stop());
@@ -191,8 +259,21 @@ export default function App() {
         // Combine all chunks into single blob
         const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
         const base64Audio = await blobToBase64(audioBlob);
+        
+        // Track audio metrics
+        const audioSizeKB = (audioBlob.size / 1024).toFixed(2);
+        setDebugMetrics((prev) => ({
+          ...prev,
+          audioSize: `${audioSizeKB} KB`,
+          audioSamples: recordedChunks.length,
+        }));
 
         if (wsRef.current?.readyState === WebSocket.OPEN) {
+          audioSentTimeRef.current = Date.now();
+          transcriptionReceivedTimeRef.current = null;
+          agentTextReceivedTimeRef.current = null;
+          audioReadyReceivedTimeRef.current = null;
+          
           wsRef.current.send(
             JSON.stringify({
               type: 'audio_data',
@@ -255,6 +336,7 @@ export default function App() {
     ws.onopen = () => {
       setIsWsConnected(true);
       setSocketState('open');
+      connectionStartTimeRef.current = Date.now();
       if (conversationActiveRef.current) {
         setStatus('Tap mic to record');
       }
@@ -291,21 +373,26 @@ export default function App() {
     ws.onmessage = async (event) => {
       const data = JSON.parse(event.data);
       trackWsEvent(data.type || 'unknown');
+      
+      setDebugMetrics((prev) => ({ ...prev, wsMessageCount: prev.wsMessageCount + 1 }));
 
       if (data.type === 'ack') {
         setChunkAckCount((prev) => prev + 1);
       }
 
       if (data.type === 'transcription') {
+        transcriptionReceivedTimeRef.current = Date.now();
         setMessages((prev) => [...prev, { role: 'user', content: data.text || '' }]);
         setStatus('Generating response...');
       }
 
       if (data.type === 'agent_text') {
+        agentTextReceivedTimeRef.current = Date.now();
         setMessages((prev) => [...prev, { role: 'assistant', content: data.text || '' }]);
       }
 
       if (data.type === 'error') {
+        setDebugMetrics((prev) => ({ ...prev, lastError: data.message }));
         setMessages((prev) => [
           ...prev,
           { role: 'assistant', content: data.message || 'Voice request failed.' },
@@ -315,6 +402,10 @@ export default function App() {
       }
 
       if (data.type === 'audio_ready' && data.audio_url) {
+        audioReadyReceivedTimeRef.current = Date.now();
+        calculateLatencies();
+        setDebugMetrics((prev) => ({ ...prev, totalTurns: prev.totalTurns + 1 }));
+        
         const audioUrl = `${API_BASE}${data.audio_url}`;
         if (audioRef.current) {
           if (audioObjectUrlRef.current) {
@@ -337,6 +428,25 @@ export default function App() {
     conversationActiveRef.current = true;
     setMessages([]);
     setStatus('Loading...');
+    
+    // Reset latencies and metrics
+    setLatencies({
+      networkLatency: '-',
+      sttLatency: '-',
+      llmLatency: '-',
+      ttsLatency: '-',
+      totalLatency: '-',
+      audioRecordingDuration: '-',
+    });
+    setDebugMetrics({
+      audioSize: '-',
+      audioSamples: 0,
+      wsMessageCount: 0,
+      lastError: '-',
+      conversationStartTime: Date.now(),
+      totalTurns: 0,
+    });
+    
     trackWsEvent('conversation_started');
     connectWebSocket();
   }
@@ -434,23 +544,74 @@ export default function App() {
       </section>
 
       <section className="mt-3 rounded-xl border border-slate-200 bg-white p-2">
-        <div className="mb-2 rounded-lg border border-slate-200 bg-slate-50 p-2 text-xs text-slate-600">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-            <span>Socket: {socketState}</span>
-            <span>Chunks sent: {chunkSentCount}</span>
-            <span>Chunks acked: {chunkAckCount}</span>
-            <span>Last event: {lastWsEvent}</span>
-          </div>
-          {wsTimeline.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1">
-              {wsTimeline.map((item) => (
-                <span key={item.id} className="rounded bg-white px-2 py-0.5 text-[11px] text-slate-500">
-                  {item.label}
-                </span>
-              ))}
+        <button
+          type="button"
+          onClick={() => setShowDebugPanel(!showDebugPanel)}
+          className="mb-2 flex w-full items-center justify-between rounded-lg border border-slate-200 bg-slate-50 p-2 text-xs font-medium text-slate-600 hover:bg-slate-100"
+        >
+          <span>🔧 Debug Console - {conversationActive ? 'Active' : 'Inactive'}</span>
+          {showDebugPanel ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+        </button>
+
+        {showDebugPanel && (
+          <div className="mb-2 space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-[11px] font-mono text-slate-600">
+            <div className="space-y-1 border-b border-slate-200 pb-2">
+              <div className="font-bold text-slate-700">⏱️ Latency Metrics</div>
+              <div className="grid grid-cols-2 gap-1 pl-2 sm:grid-cols-3">
+                <span>STT: <span className="text-blue-600">{latencies.sttLatency}</span></span>
+                <span>LLM: <span className="text-purple-600">{latencies.llmLatency}</span></span>
+                <span>TTS: <span className="text-green-600">{latencies.ttsLatency}</span></span>
+                <span>Record: <span className="text-orange-600">{latencies.audioRecordingDuration}</span></span>
+                <span>Network: <span className="text-red-600">{latencies.networkLatency}</span></span>
+                <span>Total: <span className="font-bold text-slate-900">{latencies.totalLatency}</span></span>
+              </div>
             </div>
-          )}
-        </div>
+
+            <div className="space-y-1 border-b border-slate-200 pb-2">
+              <div className="font-bold text-slate-700">🌐 Connection</div>
+              <div className="grid grid-cols-2 gap-1 pl-2">
+                <span>Socket: <span className={socketState === 'open' ? 'text-green-600 font-bold' : socketState === 'closed' ? 'text-red-600' : 'text-yellow-600'}>{socketState}</span></span>
+                <span>Messages: {debugMetrics.wsMessageCount}</span>
+              </div>
+            </div>
+
+            <div className="space-y-1 border-b border-slate-200 pb-2">
+              <div className="font-bold text-slate-700">🎤 Audio</div>
+              <div className="grid grid-cols-2 gap-1 pl-2">
+                <span>Size: {debugMetrics.audioSize}</span>
+                <span>Chunks: {chunkSentCount}</span>
+              </div>
+            </div>
+
+            <div className="space-y-1 border-b border-slate-200 pb-2">
+              <div className="font-bold text-slate-700">💬 Conversation</div>
+              <div className="grid grid-cols-2 gap-1 pl-2">
+                <span>Turns: {debugMetrics.totalTurns}</span>
+                <span>Status: <span className={conversationActive ? 'text-green-600 font-bold' : 'text-gray-600'}>{conversationActive ? 'Active' : 'Inactive'}</span></span>
+              </div>
+            </div>
+
+            {wsTimeline.length > 0 && (
+              <div className="space-y-1">
+                <div className="font-bold text-slate-700">📋 Event Timeline</div>
+                <div className="flex flex-wrap gap-1 pl-2">
+                  {wsTimeline.map((item) => (
+                    <span key={item.id} className="rounded bg-white px-1.5 py-0.5 text-[10px] text-slate-500">
+                      {item.label}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {debugMetrics.lastError !== '-' && (
+              <div className="space-y-1 border-t border-red-300 bg-red-50 p-2 rounded">
+                <div className="font-bold text-red-700">❌ Last Error</div>
+                <div className="pl-2 text-red-600 wrap-break-word">{debugMetrics.lastError}</div>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="flex items-center gap-2">
           <textarea
