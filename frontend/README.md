@@ -1,54 +1,239 @@
 # Frontend (React + Vite + Tailwind)
 
-Chat-style voice assistant frontend for the clinic app.
+Real-time voice assistant frontend using WebSocket for persistent, reliable voice interaction with the clinic booking system.
 
 ## Features
 
-- Chat interface with message history
-- Bottom text composer with send button
-- Mic toggle button (tap to start recording, tap again to stop/send)
-- Auto playback of TTS audio returned by backend
-- Loading indicator while backend processes requests
+- **Chat interface** with message history (loaded and persisted)
+- **Real-time WebSocket voice** - persistent connection across multiple recordings
+- **Bottom text composer** with send button for typing messages
+- **Mic toggle button** - tap to start recording, tap again to stop and process
+- **Auto playback** of TTS audio responses
+- **WebSocket debug panel** - live socket state, chunk counters, and event timeline
+- **Auto-reconnection** - automatically reconnects if socket closes
+- **Loading indicators** while backend processes requests
 
 ## Prerequisites
 
 - Node.js 18+
 - Backend running at `http://localhost:8000` (default)
 
-## Run
+## Setup & Run
 
 ```bash
 npm install
 npm run dev
 ```
 
-App runs on `http://localhost:5173`.
+App runs on `http://localhost:5173`
 
-## Optional Environment Variable
+### Optional Environment Variable
 
-Create a `.env` file in `frontend/` if backend URL differs:
+Create `.env` file in `frontend/` if backend URL differs:
 
 ```bash
 VITE_API_BASE=http://localhost:8000
 ```
 
-## API Contract Used by Frontend
+---
 
-### `POST /voice`
-Request: `multipart/form-data` with `file` audio blob.
+## Architecture
 
-Response JSON:
+### WebSocket Real-Time Voice Flow
 
+**Problem We Solved:**
+The original implementation streamed audio chunks individually, which caused issues:
+1. Concatenating raw webm chunks corrupts the container format
+2. Groq API rejected corrupted audio: "Error code: 400 - could not process file"
+3. Exception handling outside the loop caused connection to close after one request
+4. Mic button became disabled after first interaction
+
+**Solution:**
+Frontend now collects all audio chunks in memory, combines them into a single complete webm Blob, and sends the complete audio in one message.
+
+### Recording & Submission Flow
+
+```
+User taps mic
+    ↓
+startRecording()
+    ├─ Request microphone access
+    ├─ Create MediaRecorder
+    ├─ Initialize empty recordedChunks array
+    └─ Start recording (1500ms intervals)
+    ↓
+Recording continues...
+    ├─ ondataavailable fires every 1500ms
+    ├─ Append Blob chunks to recordedChunks
+    └─ UI shows "Recording... tap mic again to send"
+    ↓
+User taps mic again
+    ↓
+stopRecording()
+    ├─ Stop MediaRecorder
+    ├─ Close microphone stream
+    ├─ Combine all Blobs into single webm Blob
+    ├─ blobToBase64() encodes complete audio
+    └─ Send audio_data message to WebSocket
+    ↓
+Backend processes
+    ├─ STT (Groq Whisper)
+    ├─ Agent processing
+    └─ TTS (ElevenLabs)
+    ↓
+Receive response events
+    ├─ transcription → add user message
+    ├─ agent_text → add assistant message
+    └─ audio_ready → play response audio
+    ↓
+Ready for next recording ✓
+```
+
+### WebSocket Message Contract
+
+**Frontend sends (complete audio):**
 ```json
 {
-  "transcription": "user speech text",
-  "response": "assistant text",
-  "audio_base64": "<base64-mp3>",
-  "audio_mime_type": "audio/mpeg"
+  "type": "audio_data",
+  "data": "base64-encoded-webm-blob"
 }
 ```
 
-Frontend behavior:
+**Backend responds with sequence of events:**
+
+1. **User speech transcribed**
+```json
+{
+  "type": "transcription",
+  "text": "what user said"
+}
+```
+
+2. **Assistant response generated**
+```json
+{
+  "type": "agent_text",
+  "text": "what assistant replies"
+}
+```
+
+3. **Audio ready to play**
+```json
+{
+  "type": "audio_ready",
+  "audio_url": "/audio/response_<uuid>.mp3"
+}
+```
+
+4. **If error occurs**
+```json
+{
+  "type": "error",
+  "message": "descriptive error message"
+}
+```
+
+### Key Components
+
+**State Management:**
+- `messages` - chat history array
+- `isRecording` - recording in progress
+- `isLoading` - backend processing
+- `isWsConnected` - WebSocket connection status
+- `socketState` - 'connecting', 'open', 'closed', 'error'
+- `chunkSentCount` / `chunkAckCount` - recording debug info
+- `wsTimeline` - recent WebSocket events (last 6)
+
+**Key Functions:**
+- `connectWebSocket()` - establishes persistent WS connection with auto-reconnect
+- `startRecording()` - begins audio capture
+- `stopRecording()` - stops capture, combines chunks, sends to backend
+- `trackWsEvent()` - logs WebSocket events to debug panel
+- `playAudioFromBase64()` - plays base64-encoded audio from text chat
+
+### Debug Panel
+
+Located below the chat area, shows in real-time:
+- **Socket**: Current connection state
+- **Chunks sent**: Audio chunks collected during recording
+- **Chunks acked**: Not used in new implementation (kept for compatibility)
+- **Last event**: Most recent WebSocket message type
+- **Timeline**: Last 6 events (socket_open, recording_started, audio_sent, transcription, etc.)
+
+This helps troubleshoot voice issues without console access.
+
+---
+
+## API Integration
+
+### WebSocket Endpoint
+
+```
+ws://localhost:8000/ws/voice
+```
+
+**Established on component mount**, persists across multiple recordings.
+
+**Auto-reconnects** with 2-second delay if closed.
+
+### REST Endpoints Used
+
+**Text chat:**
+```
+POST /chat
+Request: { "message": "user text" }
+Response: { "response": "assistant text", "audio_base64": "...", "audio_mime_type": "audio/mpeg" }
+```
+
+**Chat history:**
+```
+GET /history
+Response: { "messages": [ { "role": "user|assistant", "content": "...", "created_at": "..." }, ... ] }
+```
+
+---
+
+## Browser Compatibility
+
+| Feature | Chrome | Firefox | Safari | Edge |
+|---------|--------|---------|--------|------|
+| MediaRecorder | ✓ | ✓ | ✓ | ✓ |
+| WebSocket | ✓ | ✓ | ✓ | ✓ |
+| getUserMedia | ✓ | ✓ | ✓ | ✓ |
+| Base64 encoding | ✓ | ✓ | ✓ | ✓ |
+
+---
+
+## Troubleshooting
+
+### Mic button disabled
+- Check browser console for errors
+- Verify backend is running and reachable
+- Check WebSocket debug panel - socket should show 'open'
+
+### "Voice socket disconnected" message
+- Backend may have crashed - restart `uvicorn app.main:app --reload`
+- Frontend will auto-reconnect in 2 seconds
+
+### No audio response
+- Check that ElevenLabs API key is set in backend .env
+- Verify audio player isn't muted
+- Check browser console for playback errors
+
+### Transcription fails
+- Ensure Groq API key is set in backend .env
+- Check audio quality - speak clearly into microphone
+- Verify webm file is being sent correctly (check network tab)
+
+---
+
+## Files
+
+- `src/App.jsx` - Main component with WebSocket & recording logic
+- `src/main.jsx` - Entry point
+- `src/index.css` - Global styles
+- `vite.config.js` - Vite configuration
+- `.env` - Optional environment variablesFrontend behavior:
 - Appends `transcription` as user chat message
 - Appends `response` as assistant chat message
 - Decodes `audio_base64` and auto-plays TTS
