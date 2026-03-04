@@ -421,6 +421,7 @@ connectWebSocket(isAutoReconnect)  // Only reconnects if conversationActive
 ```
 
 ---
+```
 {
     "transcription": "...",
     "response": "...",
