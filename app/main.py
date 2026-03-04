@@ -2,8 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 import uuid
-import base64
-import binascii
+import json
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -151,104 +150,121 @@ async def websocket_voice(ws: WebSocket):
     await ws.accept()
 
     temp_input_path = None
+    audio_buffer = bytearray()  # Buffer to accumulate binary audio data
 
     try:
         while True:
             try:
-                data = await ws.receive_json()
-                message_type = data.get("type")
+                message = await ws.receive()
+                
+                # Handle text messages (control messages)
+                if "text" in message:
+                    data = json.loads(message["text"])
+                    message_type = data.get("type")
 
-                if message_type == "audio_data":
-                    audio_base64 = data.get("data", "")
-                    if not audio_base64:
-                        await ws.send_json({
-                            "type": "error",
-                            "message": "Missing audio data"
-                        })
+                    if message_type == "start_recording":
+                        # Reset audio buffer for new recording
+                        audio_buffer = bytearray()
                         continue
-
-                    try:
-                        audio_bytes = base64.b64decode(audio_base64, validate=True)
-                    except (binascii.Error, ValueError):
-                        await ws.send_json({
-                            "type": "error",
-                            "message": "Invalid base64 audio data"
-                        })
-                        continue
-
-                    # Generate unique session ID for this transaction
-                    session_id = str(uuid.uuid4())
                     
-                    try:
-                        # MediaRecorder produces webm format
-                        temp_input_path = BASE_DIR.parent / f"temp_{session_id}.webm"
-                        with open(temp_input_path, "wb") as f:
-                            f.write(audio_bytes)
+                    elif message_type == "stop_recording":
+                        # Process accumulated audio buffer
+                        if not audio_buffer:
+                            await ws.send_json({
+                                "type": "error",
+                                "message": "No audio data received"
+                            })
+                            continue
 
-                        # STT
-                        transcription = transcribe_audio(str(temp_input_path))
+                        try:
+                            # Generate unique session ID for this transaction
+                            session_id = str(uuid.uuid4())
+                            
+                            # Write accumulated audio buffer to file (already in webm format)
+                            temp_input_path = BASE_DIR.parent / f"temp_{session_id}.webm"
+                            with open(temp_input_path, "wb") as f:
+                                f.write(audio_buffer)
+                            
+                            # Clear buffer for next recording
+                            audio_buffer = bytearray()
 
-                        await ws.send_json({
-                            "type": "transcription",
-                            "text": transcription
-                        })
+                            # STT
+                            transcription = transcribe_audio(str(temp_input_path))
 
-                        # Agent
-                        response_text = process_message(transcription)
+                            await ws.send_json({
+                                "type": "transcription",
+                                "text": transcription
+                            })
 
-                        await ws.send_json({
-                            "type": "agent_text",
-                            "text": response_text
-                        })
+                            # Agent
+                            response_text = process_message(transcription)
 
-                        now = datetime.now(timezone.utc)
-                        chat_collection.insert_many([
-                            {"role": "user", "content": transcription, "created_at": now},
-                            {"role": "assistant", "content": response_text, "created_at": now},
-                        ])
+                            await ws.send_json({
+                                "type": "agent_text",
+                                "text": response_text
+                            })
 
-                        # TTS
-                        audio_name = f"response_{session_id}.mp3"
-                        audio_path = AUDIO_DIR / audio_name
-                        text_to_speech(response_text, str(audio_path))
+                            now = datetime.now(timezone.utc)
+                            chat_collection.insert_many([
+                                {"role": "user", "content": transcription, "created_at": now},
+                                {"role": "assistant", "content": response_text, "created_at": now},
+                            ])
 
-                        await ws.send_json({
-                            "type": "audio_ready",
-                            "audio_url": f"/audio/{audio_name}"
-                        })
+                            # TTS
+                            audio_name = f"response_{session_id}.mp3"
+                            audio_path = AUDIO_DIR / audio_name
+                            text_to_speech(response_text, str(audio_path))
 
-                    except Exception as e:
-                        # Send error but keep connection alive
+                            await ws.send_json({
+                                "type": "audio_ready",
+                                "audio_url": f"/audio/{audio_name}"
+                            })
+
+                        except Exception as e:
+                            # Send error but keep connection alive
+                            await ws.send_json({
+                                "type": "error",
+                                "message": f"Processing failed: {str(e)}"
+                            })
+                        finally:
+                            # Clean up temp file after this transaction
+                            if temp_input_path:
+                                try:
+                                    temp_input_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                temp_input_path = None
+                    else:
                         await ws.send_json({
                             "type": "error",
-                            "message": f"Processing failed: {str(e)}"
+                            "message": "Unsupported control message type"
                         })
-                    finally:
-                        # Clean up temp file after this transaction
-                        if temp_input_path:
-                            try:
-                                temp_input_path.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                            temp_input_path = None
-
-                else:
-                    await ws.send_json({
-                        "type": "error",
-                        "message": "Unsupported message type"
-                    })
+                
+                # Handle binary messages (audio data)
+                elif "bytes" in message:
+                    audio_data = message["bytes"]
+                    # Append to buffer
+                    audio_buffer.extend(audio_data)
 
             except WebSocketDisconnect:
                 break
             except Exception as e:
-                # Log but don't close connection for non-disconnect errors
-                print(f"WebSocket error: {e}")
+                # Log the error
+                error_msg = str(e)
+                print(f"WebSocket error: {error_msg}")
+                
+                # If it's a connection-related error, break the loop
+                if "disconnect" in error_msg.lower() or "connection" in error_msg.lower():
+                    break
+                
+                # Try to send error message, but if it fails, break
                 try:
                     await ws.send_json({
                         "type": "error",
                         "message": "Request processing error"
                     })
                 except Exception:
+                    # Connection is broken, exit the loop
                     break
 
     finally:

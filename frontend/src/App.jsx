@@ -13,8 +13,6 @@ export default function App() {
   const [isWsConnected, setIsWsConnected] = useState(false);
   const [conversationActive, setConversationActive] = useState(false);
   const [socketState, setSocketState] = useState('disconnected');
-  const [chunkSentCount, setChunkSentCount] = useState(0);
-  const [chunkAckCount, setChunkAckCount] = useState(0);
   const [lastWsEvent, setLastWsEvent] = useState('-');
   const [wsTimeline, setWsTimeline] = useState([]);
   const [showDebugPanel, setShowDebugPanel] = useState(true);
@@ -87,28 +85,7 @@ export default function App() {
     }
   }
 
-  async function playAudioFromBase64(audioBase64, mimeType = 'audio/mpeg') {
-    if (!audioRef.current || !audioBase64) {
-      return;
-    }
 
-    const binary = atob(audioBase64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-
-    const blob = new Blob([bytes], { type: mimeType });
-    const objectUrl = URL.createObjectURL(blob);
-
-    if (audioObjectUrlRef.current) {
-      URL.revokeObjectURL(audioObjectUrlRef.current);
-    }
-
-    audioObjectUrlRef.current = objectUrl;
-    audioRef.current.src = objectUrl;
-    await audioRef.current.play().catch(() => null);
-  }
 
   function calculateLatencies() {
     const newLatencies = { ...latencies };
@@ -185,17 +162,7 @@ export default function App() {
     }
   }
 
-  function blobToBase64(blob) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const base64String = reader.result.split(',')[1];
-        resolve(base64String);
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-  }
+
 
   async function startRecording() {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
@@ -208,15 +175,12 @@ export default function App() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream);
       const recordedChunks = [];
-      setChunkSentCount(0);
-      setChunkAckCount(0);
       recordingStartTimeRef.current = Date.now();
       trackWsEvent('recording_started');
 
       mediaRecorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
           recordedChunks.push(event.data);
-          setChunkSentCount((prev) => prev + 1);
         }
       };
 
@@ -258,7 +222,6 @@ export default function App() {
       try {
         // Combine all chunks into single blob
         const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-        const base64Audio = await blobToBase64(audioBlob);
         
         // Track audio metrics
         const audioSizeKB = (audioBlob.size / 1024).toFixed(2);
@@ -274,12 +237,24 @@ export default function App() {
           agentTextReceivedTimeRef.current = null;
           audioReadyReceivedTimeRef.current = null;
           
+          // Send control message: start_recording
           wsRef.current.send(
             JSON.stringify({
-              type: 'audio_data',
-              data: base64Audio,
+              type: 'start_recording',
             }),
           );
+          
+          // Convert blob to ArrayBuffer and send as binary
+          const arrayBuffer = await audioBlob.arrayBuffer();
+          wsRef.current.send(arrayBuffer);
+          
+          // Send control message: stop_recording
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'stop_recording',
+            }),
+          );
+          
           trackWsEvent('audio_sent');
         } else {
           setIsLoading(false);
@@ -376,10 +351,6 @@ export default function App() {
       
       setDebugMetrics((prev) => ({ ...prev, wsMessageCount: prev.wsMessageCount + 1 }));
 
-      if (data.type === 'ack') {
-        setChunkAckCount((prev) => prev + 1);
-      }
-
       if (data.type === 'transcription') {
         transcriptionReceivedTimeRef.current = Date.now();
         setMessages((prev) => [...prev, { role: 'user', content: data.text || '' }]);
@@ -458,8 +429,6 @@ export default function App() {
     mediaRecorderRef.current = null;
     setIsRecording(false);
     setIsLoading(false);
-    setChunkSentCount(0);
-    setChunkAckCount(0);
     setStatus('Conversation ended. Click "Start Conversation" to begin.');
     trackWsEvent('conversation_stopped');
 
@@ -579,7 +548,7 @@ export default function App() {
               <div className="font-bold text-slate-700">🎤 Audio</div>
               <div className="grid grid-cols-2 gap-1 pl-2">
                 <span>Size: {debugMetrics.audioSize}</span>
-                <span>Chunks: {chunkSentCount}</span>
+                <span>Samples: {debugMetrics.audioSamples}</span>
               </div>
             </div>
 
