@@ -6,12 +6,13 @@ const WS_BASE = API_BASE.replace(/^http/i, 'ws');
 
 export default function App() {
   const [messages, setMessages] = useState([]);
-  const [status, setStatus] = useState('Tap mic to Start');
+  const [status, setStatus] = useState('Conversation ended. Click "Start Conversation" to begin.');
   const [isRecording, setIsRecording] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [textInput, setTextInput] = useState('');
   const [isWsConnected, setIsWsConnected] = useState(false);
-  const [socketState, setSocketState] = useState('connecting');
+  const [conversationActive, setConversationActive] = useState(false);
+  const [socketState, setSocketState] = useState('disconnected');
   const [chunkSentCount, setChunkSentCount] = useState(0);
   const [chunkAckCount, setChunkAckCount] = useState(0);
   const [lastWsEvent, setLastWsEvent] = useState('-');
@@ -22,6 +23,7 @@ export default function App() {
   const audioRef = useRef(null);
   const audioObjectUrlRef = useRef(null);
   const wsRef = useRef(null);
+  const conversationActiveRef = useRef(false);
 
   useEffect(() => {
     loadHistory();
@@ -240,14 +242,22 @@ export default function App() {
     });
   }
 
-  function connectWebSocket() {
+  function connectWebSocket(isAutoReconnect = false) {
+    // Don't auto-reconnect if conversation is not active
+    if (isAutoReconnect && !conversationActiveRef.current) {
+      setSocketState('disconnected');
+      return;
+    }
+
     setSocketState('connecting');
     const ws = new WebSocket(`${WS_BASE}/ws/voice`);
 
     ws.onopen = () => {
       setIsWsConnected(true);
       setSocketState('open');
-      setStatus('Tap mic to record');
+      if (conversationActiveRef.current) {
+        setStatus('Tap mic to record');
+      }
       trackWsEvent('socket_open');
     };
 
@@ -258,14 +268,18 @@ export default function App() {
       mediaRecorderRef.current = null;
       setIsRecording(false);
       setIsLoading(false);
-      setStatus('Voice socket disconnected - reconnecting...');
       trackWsEvent('socket_close');
-      
-      // Auto-reconnect after 2 seconds
-      setTimeout(() => {
-        trackWsEvent('reconnecting');
-        connectWebSocket();
-      }, 2000);
+
+      // Only auto-reconnect if conversation is still active
+      if (conversationActiveRef.current) {
+        setStatus('Connection lost - reconnecting...');
+        setTimeout(() => {
+          trackWsEvent('reconnecting');
+          connectWebSocket(true);
+        }, 2000);
+      } else {
+        setStatus('Conversation ended. Click "Start Conversation" to begin.');
+      }
     };
 
     ws.onerror = () => {
@@ -318,12 +332,45 @@ export default function App() {
     wsRef.current = ws;
   }
 
-  useEffect(() => {
+  function startConversation() {
+    setConversationActive(true);
+    conversationActiveRef.current = true;
+    setMessages([]);
+    setStatus('Loading...');
+    trackWsEvent('conversation_started');
     connectWebSocket();
+  }
 
+  function stopConversation() {
+    setConversationActive(false);
+    conversationActiveRef.current = false;
+    mediaRecorderRef.current?.stream?.getTracks()?.forEach((track) => track.stop());
+    mediaRecorderRef.current = null;
+    setIsRecording(false);
+    setIsLoading(false);
+    setChunkSentCount(0);
+    setChunkAckCount(0);
+    setStatus('Conversation ended. Click "Start Conversation" to begin.');
+    trackWsEvent('conversation_stopped');
+
+    // Close WebSocket gracefully
+    if (wsRef.current) {
+      wsRef.current.onclose = null; // Prevent auto-reconnect
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setIsWsConnected(false);
+    setSocketState('disconnected');
+  }
+
+  useEffect(() => {
+    // Load history on mount
+    loadHistory();
+
+    // Cleanup on unmount
     return () => {
       if (wsRef.current) {
-        wsRef.current.onclose = null; // Prevent reconnection on unmount
+        wsRef.current.onclose = null;
         wsRef.current.close();
       }
     };
@@ -332,8 +379,31 @@ export default function App() {
   return (
     <main className="mx-auto flex h-dvh w-full max-w-4xl flex-col bg-slate-50 p-4 text-slate-900">
       <header className="mb-3 border-b border-slate-200 pb-3">
-        <h1 className="text-lg font-semibold">Clinic Voice Assistant</h1>
-        <p className="mt-1 text-sm text-slate-500">{status}</p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-lg font-semibold">Clinic Voice Assistant</h1>
+            <p className="mt-1 text-sm text-slate-500">{status}</p>
+          </div>
+          {conversationActive ? (
+            <button
+              type="button"
+              onClick={stopConversation}
+              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+              aria-label="Stop conversation"
+            >
+              Stop Conversation
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={startConversation}
+              className="rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50"
+              aria-label="Start conversation"
+            >
+              Start Conversation
+            </button>
+          )}
+        </div>
       </header>
 
       <section
@@ -388,15 +458,15 @@ export default function App() {
             onChange={(event) => setTextInput(event.target.value)}
             onKeyDown={handleInputKeyDown}
             rows={1}
-            placeholder="Type your message..."
+            placeholder={conversationActive ? "Type your message..." : "Start a conversation first..."}
             className="max-h-28 flex-1 resize-none rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
-            disabled={isLoading}
+            disabled={isLoading || !conversationActive}
           />
 
           <button
             type="button"
             onClick={sendTextMessage}
-            disabled={isLoading || isRecording || !textInput.trim()}
+            disabled={isLoading || isRecording || !textInput.trim() || !conversationActive}
             className="rounded-lg bg-blue-600 p-2 text-white disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="Send message"
           >
@@ -406,11 +476,12 @@ export default function App() {
           <button
             type="button"
             onClick={toggleMic}
-            disabled={isLoading || !isWsConnected}
+            disabled={isLoading || !isWsConnected || !conversationActive}
             className={`rounded-lg p-2 text-white disabled:cursor-not-allowed disabled:opacity-50 ${
               isRecording ? 'bg-red-600' : 'bg-emerald-600'
             }`}
             aria-label={isRecording ? 'Stop recording' : 'Start recording'}
+            title={!conversationActive ? 'Start a conversation first' : ''}
           >
             {isRecording ? <Square className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
           </button>

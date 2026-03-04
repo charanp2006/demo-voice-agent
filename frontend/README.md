@@ -5,15 +5,114 @@ Real-time voice assistant frontend using WebSocket for persistent, reliable voic
 ## Features
 
 - **Chat interface** with message history (loaded and persisted)
-- **Real-time WebSocket voice** - persistent connection across multiple recordings
+- **Conversation Lifecycle Control** - explicit Start/Stop buttons for session management
+- **Real-time WebSocket voice** - persistent connection across multiple recordings within one conversation
 - **Bottom text composer** with send button for typing messages
 - **Mic toggle button** - tap to start recording, tap again to stop and process
 - **Auto playback** of TTS audio responses
 - **WebSocket debug panel** - live socket state, chunk counters, and event timeline
-- **Auto-reconnection** - automatically reconnects if socket closes
+- **Smart Auto-reconnection** - reconnects only when conversation is active
 - **Loading indicators** while backend processes requests
 
-## Prerequisites
+---
+
+## Conversation Lifecycle
+
+### Session Control
+
+The new implementation gives users explicit control over conversation sessions using Start/Stop buttons in the header:
+
+**Before (Always Connected):**
+- WebSocket opened on page load
+- Auto-reconnected after any disconnect
+- No clear session boundaries
+- Difficult to understand when socket was active
+
+**After (Explicit Sessions):**
+- Page loads with no connection
+- Click "Start Conversation" to open session
+- Click "Stop Conversation" to close session cleanly
+- Clear visual feedback (green button = start, red button = stop)
+
+### State Diagram
+
+```
+Page Load
+    ↓
+┌─ No Connection ─────────────────────────────┐
+│ ✓ Mic button disabled                       │
+│ ✓ Text input disabled                       │
+│ ✓ "Start Conversation" button (green)       │
+│ Status: "Conversation ended..."             │
+└─────────────────────────────────────────────┘
+         ↓                                ↑
+    Click Start              Click Stop   │
+         ↓                      ↑         │
+    [Connecting]               │         │
+         ↓                      │         │
+┌─ Active Conversation ──────────┤─┐
+│ ✓ WebSocket open              │ │
+│ ✓ Mic button enabled          │ │
+│ ✓ Text input enabled          │ │
+│ ✓ "Stop Conversation" (red)   │ │
+│ ✓ Chat updates               │ │
+│ ✓ Auto-reconnect if dropped  │ │
+└──────────────────────────────┘ │
+         │                       │
+    (Multiple Turns)             │
+    • Voice recording            │
+    • Text chat                  │
+    • Interleaved responses      │
+         │                       │
+         └───────────────────────┘
+```
+
+### Multiple Turns Within One Conversation
+
+Once a conversation is started, you can:
+1. Record unlimited voice messages
+2. Send unlimited text messages
+3. Interleave voice and text
+4. WebSocket persists across all turns
+5. No reconnections between turns
+6. Chat history accumulates
+
+```
+Start Conversation
+    ↓
+Turn 1: Voice + Response
+    ↓
+Turn 2: Text + Response
+    ↓
+Turn 3: Voice + Response
+    ↓
+Turn 4: Voice + Response
+    ↓
+(WebSocket stays open the entire time)
+```
+
+### Error Recovery
+
+**Internet Disconnect:**
+- Frontend detects WebSocket close
+- Automatically attempts to reconnect every 2 seconds
+- Reconnects successfully when internet returns
+- **Conversation remains active** throughout
+- User can continue using mic immediately after reconnect
+
+**Backend Server Down:**
+- WebSocket close triggers reconnect loop
+- Frontend keeps trying every 2 seconds
+- When server restarts, next reconnect succeeds
+- **Conversation stays active** if not manually stopped
+
+**Browser Refresh:**
+- Conversation stops (by design)
+- Chat history loads from backend
+- Must click "Start Conversation" to begin new session
+- Prevents accidental double-session
+
+---
 
 - Node.js 18+
 - Backend running at `http://localhost:8000` (default)

@@ -182,7 +182,99 @@ Frontend                                Backend
 
 ---
 
-## Complete Application Flow
+## Conversation Lifecycle Management
+
+### The Problem: Always-Open Connections
+
+The initial implementation auto-connected on page load and auto-reconnected after any disconnect. This created issues:
+- No clear session boundaries for users
+- Hard to tell if socket was active
+- Difficult to stop a conversation intentionally
+- Unclear error states
+
+### The Solution: Explicit Start/Stop Control
+
+**New approach:**
+- Page loads with **no WebSocket connection**
+- User clicks "Start Conversation" to open session
+- WebSocket persists across **multiple turns** (voice + text interleaved)
+- User clicks "Stop Conversation" to close session cleanly
+- Disconnects only auto-reconnect if conversation is still active
+
+### Session State Machine
+
+```
+[DISCONNECTED]
+     ↑     ↓
+     │  Click Start
+     │     ↓
+     │ [CONNECTING]
+     │     ↓
+     │  ↓ Success
+     │  [OPEN] ← Multiple turns happen here
+     │     ↓
+     │  Click Stop  OR  Network fails
+     │     ↓
+     └─ [CLOSED] ← No auto-reconnect if user clicked stop
+```
+
+### Multiple Turns Behavior
+
+Once conversation is started, users can:
+- Record **multiple voice messages** without reconnecting
+- Send **multiple text messages** without reconnecting
+- **Interleave** voice and text seamlessly
+- **Continuous socket** - no reconnections between turns
+- **Shared context** - agent remembers conversation history
+
+Example sequence:
+```
+User: "Schedule appointment" (voice)
+  ↓
+Assistant: "What date?" (response)
+  ↓
+User: "March 25th" (text)
+  ↓
+Assistant: "What time?" (response)
+  ↓
+User: "5 PM" (voice)
+  ↓
+Assistant: "Confirmed!" (response)
+  ↓
+(Socket stayed open the entire time)
+```
+
+### Auto-Reconnection Safety
+
+**When conversation is ACTIVE:**
+- Network disconnect → Auto-reconnect attempts every 2 seconds
+- Backend crash → Keep attempting until server restarts
+- Seamless recovery → User can continue immediately
+
+**When conversation is STOPPED:**
+- Network disconnect → **No reconnection attempt**
+- Socket closes → Stays closed
+- User must click "Start Conversation" again
+- Fresh session boundaries
+
+This prevents background reconnection attempts when user intentionally stopped.
+
+### Frontend Implementation
+
+**Key state variables:**
+```javascript
+conversationActive        // Track if user clicked "Start"
+conversationActiveRef     // Ref version for callbacks (doesn't change)
+```
+
+**Key functions:**
+```javascript
+startConversation()       // Opens SessionID + WebSocket
+stopConversation()        // Closes WebSocket + resets state
+connectWebSocket(isAutoReconnect)  // Only reconnects if conversationActive
+```
+
+---
 {
     "transcription": "...",
     "response": "...",

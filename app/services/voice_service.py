@@ -43,8 +43,8 @@ def text_to_speech(text: str, output_path: str):
     except Exception as e:
         print(f"ElevenLabs TTS failed: {e}. Falling back to gTTS.")
 
-        # tts = gTTS(text=text, lang='en')
-        # tts.save(output_path)
+        tts = gTTS(text=text, lang='en')
+        tts.save(output_path)
     return output_path
 
 
