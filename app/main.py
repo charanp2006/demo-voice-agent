@@ -1,9 +1,11 @@
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+import uuid
 import base64
-
-from fastapi import FastAPI, UploadFile, File
+import binascii
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import clinic
 from pydantic import BaseModel
@@ -142,3 +144,120 @@ async def voice_endpoint(file: UploadFile = File(...)):
         "audio_base64": audio_base64,
         "audio_mime_type": "audio/mpeg"
     }
+
+# --- WebSocket Endpoint for Real-Time Chat --- #
+@app.websocket("/ws/voice")
+async def websocket_voice(ws: WebSocket):
+    await ws.accept()
+
+    temp_input_path = None
+
+    try:
+        while True:
+            try:
+                data = await ws.receive_json()
+                message_type = data.get("type")
+
+                if message_type == "audio_data":
+                    audio_base64 = data.get("data", "")
+                    if not audio_base64:
+                        await ws.send_json({
+                            "type": "error",
+                            "message": "Missing audio data"
+                        })
+                        continue
+
+                    try:
+                        audio_bytes = base64.b64decode(audio_base64, validate=True)
+                    except (binascii.Error, ValueError):
+                        await ws.send_json({
+                            "type": "error",
+                            "message": "Invalid base64 audio data"
+                        })
+                        continue
+
+                    # Generate unique session ID for this transaction
+                    session_id = str(uuid.uuid4())
+                    
+                    try:
+                        # MediaRecorder produces webm format
+                        temp_input_path = BASE_DIR.parent / f"temp_{session_id}.webm"
+                        with open(temp_input_path, "wb") as f:
+                            f.write(audio_bytes)
+
+                        # STT
+                        transcription = transcribe_audio(str(temp_input_path))
+
+                        await ws.send_json({
+                            "type": "transcription",
+                            "text": transcription
+                        })
+
+                        # Agent
+                        response_text = process_message(transcription)
+
+                        await ws.send_json({
+                            "type": "agent_text",
+                            "text": response_text
+                        })
+
+                        now = datetime.now(timezone.utc)
+                        chat_collection.insert_many([
+                            {"role": "user", "content": transcription, "created_at": now},
+                            {"role": "assistant", "content": response_text, "created_at": now},
+                        ])
+
+                        # TTS
+                        audio_name = f"response_{session_id}.mp3"
+                        audio_path = AUDIO_DIR / audio_name
+                        text_to_speech(response_text, str(audio_path))
+
+                        await ws.send_json({
+                            "type": "audio_ready",
+                            "audio_url": f"/audio/{audio_name}"
+                        })
+
+                    except Exception as e:
+                        # Send error but keep connection alive
+                        await ws.send_json({
+                            "type": "error",
+                            "message": f"Processing failed: {str(e)}"
+                        })
+                    finally:
+                        # Clean up temp file after this transaction
+                        if temp_input_path:
+                            try:
+                                temp_input_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                            temp_input_path = None
+
+                else:
+                    await ws.send_json({
+                        "type": "error",
+                        "message": "Unsupported message type"
+                    })
+
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                # Log but don't close connection for non-disconnect errors
+                print(f"WebSocket error: {e}")
+                try:
+                    await ws.send_json({
+                        "type": "error",
+                        "message": "Request processing error"
+                    })
+                except Exception:
+                    break
+
+    finally:
+        # Final cleanup when connection closes
+        if temp_input_path:
+            try:
+                temp_input_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    
+# app.mount("/audio", StaticFiles(directory=BASE_DIR.parent / "audio"), name="audio")
+app.mount("/audio", StaticFiles(directory="audio"), name="audio")

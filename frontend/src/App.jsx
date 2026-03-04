@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Mic, Send, Square } from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
+const WS_BASE = API_BASE.replace(/^http/i, 'ws');
 
 export default function App() {
   const [messages, setMessages] = useState([]);
@@ -9,12 +10,18 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [textInput, setTextInput] = useState('');
+  const [isWsConnected, setIsWsConnected] = useState(false);
+  const [socketState, setSocketState] = useState('connecting');
+  const [chunkSentCount, setChunkSentCount] = useState(0);
+  const [chunkAckCount, setChunkAckCount] = useState(0);
+  const [lastWsEvent, setLastWsEvent] = useState('-');
+  const [wsTimeline, setWsTimeline] = useState([]);
 
   const mediaRecorderRef = useRef(null);
-  const chunksRef = useRef([]);
   const chatRef = useRef(null);
   const audioRef = useRef(null);
   const audioObjectUrlRef = useRef(null);
+  const wsRef = useRef(null);
 
   useEffect(() => {
     loadHistory();
@@ -110,21 +117,43 @@ export default function App() {
     }
   }
 
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64String = reader.result.split(',')[1];
+        resolve(base64String);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
   async function startRecording() {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setStatus('Voice socket disconnected. Retry in a moment.');
+      trackWsEvent('send_blocked', 'socket_not_open');
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      chunksRef.current = [];
+      const mediaRecorder = new MediaRecorder(stream);
+      const recordedChunks = [];
+      setChunkSentCount(0);
+      setChunkAckCount(0);
+      trackWsEvent('recording_started');
 
-      recorder.ondataavailable = (event) => {
+      mediaRecorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
-          chunksRef.current.push(event.data);
+          recordedChunks.push(event.data);
+          setChunkSentCount((prev) => prev + 1);
         }
       };
 
-      recorder.onstop = handleStopRecording;
-      recorder.start();
-      mediaRecorderRef.current = recorder;
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorderRef.current.recordedChunks = recordedChunks;
+      mediaRecorder.start(1500);
       setIsRecording(true);
       setStatus('Recording... tap mic again to send');
     } catch (_error) {
@@ -132,53 +161,56 @@ export default function App() {
     }
   }
 
-  function stopRecording() {
+  async function stopRecording() {
     if (!mediaRecorderRef.current) {
       return;
     }
-    setIsLoading(true);
-    setStatus('Processing...');
-    mediaRecorderRef.current.stop();
-  }
 
-  async function handleStopRecording() {
     const recorder = mediaRecorderRef.current;
-    const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-    const file = new File([blob], 'voice.webm', { type: 'audio/webm' });
-    const formData = new FormData();
-    formData.append('file', file);
+    const recordedChunks = recorder.recordedChunks || [];
+    
+    recorder.stop();
+    recorder.stream?.getTracks()?.forEach((track) => track.stop());
+    setIsRecording(false);
+    setIsLoading(true);
+    setStatus('Processing voice...');
+    trackWsEvent('recording_stopped');
 
-    try {
-      const res = await fetch(`${API_BASE}/voice`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!res.ok) {
-        throw new Error('Voice request failed');
+    // Wait a bit for ondataavailable to fire
+    setTimeout(async () => {
+      if (!recordedChunks.length) {
+        setIsLoading(false);
+        setStatus('No audio recorded');
+        mediaRecorderRef.current = null;
+        return;
       }
 
-      const data = await res.json();
-      setMessages((prev) => [
-        ...prev,
-        { role: 'user', content: data.transcription || '' },
-        { role: 'assistant', content: data.response || '' },
-      ]);
+      try {
+        // Combine all chunks into single blob
+        const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+        const base64Audio = await blobToBase64(audioBlob);
 
-      await playAudioFromBase64(data.audio_base64, data.audio_mime_type);
-    } catch (_error) {
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: 'Failed to process voice request.' },
-      ]);
-    } finally {
-      recorder?.stream?.getTracks()?.forEach((track) => track.stop());
-      mediaRecorderRef.current = null;
-      chunksRef.current = [];
-      setIsRecording(false);
-      setIsLoading(false);
-      setStatus('Tap mic to record');
-    }
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'audio_data',
+              data: base64Audio,
+            }),
+          );
+          trackWsEvent('audio_sent');
+        } else {
+          setIsLoading(false);
+          setStatus('Voice socket disconnected. Retry in a moment.');
+          trackWsEvent('audio_send_failed', 'socket_not_open');
+        }
+      } catch (error) {
+        setIsLoading(false);
+        setStatus('Failed to process audio');
+        trackWsEvent('audio_process_failed', error.message);
+      } finally {
+        mediaRecorderRef.current = null;
+      }
+    }, 100);
   }
 
   function toggleMic() {
@@ -198,6 +230,104 @@ export default function App() {
       sendTextMessage();
     }
   }
+
+  function trackWsEvent(type, details = '') {
+    const label = details ? `${type}: ${details}` : type;
+    setLastWsEvent(label);
+    setWsTimeline((prev) => {
+      const next = [...prev, { id: `${Date.now()}-${Math.random()}`, label }];
+      return next.slice(-6);
+    });
+  }
+
+  function connectWebSocket() {
+    setSocketState('connecting');
+    const ws = new WebSocket(`${WS_BASE}/ws/voice`);
+
+    ws.onopen = () => {
+      setIsWsConnected(true);
+      setSocketState('open');
+      setStatus('Tap mic to record');
+      trackWsEvent('socket_open');
+    };
+
+    ws.onclose = () => {
+      setIsWsConnected(false);
+      setSocketState('closed');
+      mediaRecorderRef.current?.stream?.getTracks()?.forEach((track) => track.stop());
+      mediaRecorderRef.current = null;
+      setIsRecording(false);
+      setIsLoading(false);
+      setStatus('Voice socket disconnected - reconnecting...');
+      trackWsEvent('socket_close');
+      
+      // Auto-reconnect after 2 seconds
+      setTimeout(() => {
+        trackWsEvent('reconnecting');
+        connectWebSocket();
+      }, 2000);
+    };
+
+    ws.onerror = () => {
+      setSocketState('error');
+      setStatus('Voice socket error');
+      trackWsEvent('socket_error');
+    };
+
+    ws.onmessage = async (event) => {
+      const data = JSON.parse(event.data);
+      trackWsEvent(data.type || 'unknown');
+
+      if (data.type === 'ack') {
+        setChunkAckCount((prev) => prev + 1);
+      }
+
+      if (data.type === 'transcription') {
+        setMessages((prev) => [...prev, { role: 'user', content: data.text || '' }]);
+        setStatus('Generating response...');
+      }
+
+      if (data.type === 'agent_text') {
+        setMessages((prev) => [...prev, { role: 'assistant', content: data.text || '' }]);
+      }
+
+      if (data.type === 'error') {
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: data.message || 'Voice request failed.' },
+        ]);
+        setIsLoading(false);
+        setStatus('Tap mic to record');
+      }
+
+      if (data.type === 'audio_ready' && data.audio_url) {
+        const audioUrl = `${API_BASE}${data.audio_url}`;
+        if (audioRef.current) {
+          if (audioObjectUrlRef.current) {
+            URL.revokeObjectURL(audioObjectUrlRef.current);
+            audioObjectUrlRef.current = null;
+          }
+          audioRef.current.src = audioUrl;
+          await audioRef.current.play().catch(() => null);
+        }
+        setIsLoading(false);
+        setStatus('Tap mic to record');
+      }
+    };
+
+    wsRef.current = ws;
+  }
+
+  useEffect(() => {
+    connectWebSocket();
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.onclose = null; // Prevent reconnection on unmount
+        wsRef.current.close();
+      }
+    };
+  }, []);
 
   return (
     <main className="mx-auto flex h-dvh w-full max-w-4xl flex-col bg-slate-50 p-4 text-slate-900">
@@ -234,6 +364,24 @@ export default function App() {
       </section>
 
       <section className="mt-3 rounded-xl border border-slate-200 bg-white p-2">
+        <div className="mb-2 rounded-lg border border-slate-200 bg-slate-50 p-2 text-xs text-slate-600">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+            <span>Socket: {socketState}</span>
+            <span>Chunks sent: {chunkSentCount}</span>
+            <span>Chunks acked: {chunkAckCount}</span>
+            <span>Last event: {lastWsEvent}</span>
+          </div>
+          {wsTimeline.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {wsTimeline.map((item) => (
+                <span key={item.id} className="rounded bg-white px-2 py-0.5 text-[11px] text-slate-500">
+                  {item.label}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
         <div className="flex items-center gap-2">
           <textarea
             value={textInput}
@@ -258,7 +406,7 @@ export default function App() {
           <button
             type="button"
             onClick={toggleMic}
-            disabled={isLoading}
+            disabled={isLoading || !isWsConnected}
             className={`rounded-lg p-2 text-white disabled:cursor-not-allowed disabled:opacity-50 ${
               isRecording ? 'bg-red-600' : 'bg-emerald-600'
             }`}
