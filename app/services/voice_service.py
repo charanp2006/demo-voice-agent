@@ -24,8 +24,8 @@ def text_to_speech(text: str, output_path: str):
         # Try using ElevenLabs first
         audio_generator = eleven_client.text_to_speech.convert(
             text=text,
-            # voice_id="SAz9YHcvj6GT2YYXdXww",  # River - Relaxed, Neutral, Informative
-            voice_id="IKne3meq5aSn9XLyUdCD",  # Charlie - Deep, Confident, Energetic
+            voice_id="SAz9YHcvj6GT2YYXdXww",  # River - Relaxed, Neutral, Informative
+            # voice_id="IKne3meq5aSn9XLyUdCD",  # Charlie - Deep, Confident, Energetic
             model_id="eleven_turbo_v2"
             
             # Other male voice options:
