@@ -1,20 +1,52 @@
+"""
+SmileCare Dental Clinic – FastAPI application with real-time WebSocket voice conversation.
+
+WebSocket protocol
+──────────────────
+Client → Server:
+  { "type": "start_conversation" }
+  (binary)  audio_chunk  (PCM-16 LE, 16 kHz, mono)
+  { "type": "end_of_speech" }
+  { "type": "stop_conversation" }
+
+Server → Client:
+  { "type": "conversation_started", "session_id": "..." }
+  { "type": "partial_transcript", "text": "..." }
+  { "type": "final_transcript",   "text": "..." }
+  { "type": "assistant_stream",    "text": "..." }
+  { "type": "assistant_done" }
+  { "type": "error", "message": "..." }
+"""
+
+import asyncio
+import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
-import uuid
-import json
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from app.routers import clinic
-from pydantic import BaseModel
-from app.services.agent_service import process_message
-from app.services.voice_service import transcribe_audio, text_to_speech
-from fastapi.responses import FileResponse
-from app.database import chat_collection
-import shutil
 
-app = FastAPI()
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from app.database import (
+    chat_messages_collection,
+    conversations_collection,
+    seed_initial_data,
+)
+from app.models.schema import ChatRequest
+from app.routers import clinic
+from app.services.agent_service import process_message, process_message_stream
+from app.services.voice_service import (
+    pcm_to_wav,
+    text_to_speech,
+    text_to_speech_bytes_async,
+    transcribe_audio_bytes_async,
+)
+
+# ── App init ─────────────────────────────────────────────────
+
+app = FastAPI(title="SmileCare Dental Clinic", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,250 +62,208 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 app.include_router(clinic.router)
 
-class ChatRequest(BaseModel):
-    message: str
+
+# ── Startup event ────────────────────────────────────────────
+
+@app.on_event("startup")
+def on_startup():
+    seed_initial_data()
 
 
-def _serialize_chat_message(message: dict):
-    message["_id"] = str(message["_id"])
-    created_at = message.get("created_at")
-    if created_at and isinstance(created_at, datetime):
-        message["created_at"] = created_at.isoformat()
-    return message
-
-
-def _generate_tts_base64(text: str):
-    output_name = f"tts_{uuid4().hex}.mp3"
-    output_path = AUDIO_DIR / output_name
-    text_to_speech(text, str(output_path))
-
-    with open(output_path, "rb") as audio_file:
-        audio_bytes = audio_file.read()
-
-    try:
-        output_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    return base64.b64encode(audio_bytes).decode("utf-8")
-
+# ── REST endpoints ───────────────────────────────────────────
 
 @app.get("/history")
-def get_history(limit: int = 50):
+def get_history(session_id: str = None, limit: int = 50):
     safe_limit = max(1, min(limit, 200))
-    messages = list(chat_collection.find().sort("created_at", -1).limit(safe_limit))
+    query = {}
+    if session_id:
+        query["session_id"] = session_id
+    messages = list(
+        chat_messages_collection.find(query).sort("created_at", -1).limit(safe_limit)
+    )
     messages.reverse()
-    return {"messages": [_serialize_chat_message(message) for message in messages]}
+    for m in messages:
+        m["_id"] = str(m["_id"])
+        if isinstance(m.get("created_at"), datetime):
+            m["created_at"] = m["created_at"].isoformat()
+    return {"messages": messages}
 
-# --- Chat Endpoint --- #
+
 @app.post("/chat")
 def chat(request: ChatRequest):
+    """Simple text chat (non-streaming, for testing)."""
     reply = process_message(request.message)
-    audio_base64 = _generate_tts_base64(reply)
     now = datetime.now(timezone.utc)
-    chat_collection.insert_many([
-        {"role": "user", "content": request.message, "created_at": now},
-        {"role": "assistant", "content": reply, "created_at": now},
+    chat_messages_collection.insert_many([
+        {"role": "user", "content": request.message, "message_type": "text", "created_at": now},
+        {"role": "assistant", "content": reply, "message_type": "text", "created_at": now},
     ])
-    return {
-        "response": reply,
-        "audio_base64": audio_base64,
-        "audio_mime_type": "audio/mpeg"
-    }
+    return {"response": reply}
 
 
-# --- Test STT Endpoint --- #
-@app.post("/test-stt")
-async def test_stt(file: UploadFile = File(...)):
+# ── WebSocket – real-time voice conversation ─────────────────
 
-    # Save the uploaded file to a temporary location
-    file_location = f"temp_{file.filename}"
-    with open(file_location, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Transcribe the audio file
-    text = transcribe_audio(file_location)
-    return {"transcription": text}
+PARTIAL_TRANSCRIPTION_INTERVAL = 2.0   # seconds between interim STT calls
+SAMPLE_RATE = 16000                     # expected PCM sample rate from client
 
 
-# --- Test TTS Endpoint --- #
-@app.post("/test-tts")
-async def test_tts(request: ChatRequest):
-    
-    # Generate audio from text
-    temp_output = "test_tts_output.mp3"
-    text_to_speech(request.message, temp_output)
-    
-    return FileResponse(temp_output, media_type="audio/mpeg")
-
-
-@app.post("/voice")
-async def voice_endpoint(file: UploadFile = File(...)):
-
-    # Save the uploaded file to a temporary location
-    input_name = f"temp_{uuid4().hex}_{file.filename}"
-    temp_input = BASE_DIR.parent / input_name
-
-    with open(temp_input, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Step 1: Transcribe
-    user_text = transcribe_audio(str(temp_input))
-
-    # Step 2: Send to agent
-    response_text = process_message(user_text)
-
-    # Step 3: Convert response to speech
-    audio_base64 = _generate_tts_base64(response_text)
-
-    now = datetime.now(timezone.utc)
-    chat_collection.insert_many([
-        {"role": "user", "content": user_text, "created_at": now},
-        {"role": "assistant", "content": response_text, "created_at": now},
-    ])
-
-    try:
-        temp_input.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    return {
-        "transcription": user_text,
-        "response": response_text,
-        "audio_base64": audio_base64,
-        "audio_mime_type": "audio/mpeg"
-    }
-
-# --- WebSocket Endpoint for Real-Time Chat --- #
 @app.websocket("/ws/voice")
 async def websocket_voice(ws: WebSocket):
     await ws.accept()
 
-    temp_input_path = None
-    audio_buffer = bytearray()  # Buffer to accumulate binary audio data
+    session_id: str | None = None
+    audio_buffer = bytearray()
+    conversation_history: list[dict] = []
+    partial_task: asyncio.Task | None = None
+    last_partial_time: float = 0.0
+    is_active = False
+
+    async def _send(payload: dict):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            pass
+
+    async def _run_partial_transcription(snapshot: bytes):
+        """Background task: transcribe accumulated audio and send partial result."""
+        try:
+            wav = pcm_to_wav(snapshot, sample_rate=SAMPLE_RATE)
+            text = await transcribe_audio_bytes_async(wav)
+            if text and text.strip():
+                await _send({"type": "partial_transcript", "text": text.strip()})
+        except Exception as exc:
+            print(f"[partial-stt] {exc}")
 
     try:
         while True:
-            try:
-                message = await ws.receive()
-                
-                # Handle text messages (control messages)
-                if "text" in message:
-                    data = json.loads(message["text"])
-                    message_type = data.get("type")
+            message = await ws.receive()
 
-                    if message_type == "start_recording":
-                        # Reset audio buffer for new recording
-                        audio_buffer = bytearray()
+            # ── Text control messages ────────────────────────
+            if "text" in message:
+                data = json.loads(message["text"])
+                msg_type = data.get("type", "")
+
+                # ── start_conversation ──
+                if msg_type == "start_conversation":
+                    session_id = str(uuid4())
+                    audio_buffer = bytearray()
+                    conversation_history = []
+                    is_active = True
+                    last_partial_time = time.time()
+
+                    conversations_collection.insert_one({
+                        "session_id": session_id,
+                        "started_at": datetime.now(timezone.utc),
+                        "status": "active",
+                    })
+
+                    await _send({"type": "conversation_started", "session_id": session_id})
+                    continue
+
+                # ── end_of_speech ──
+                if msg_type == "end_of_speech":
+                    if partial_task and not partial_task.done():
+                        partial_task.cancel()
+
+                    if not audio_buffer:
+                        await _send({"type": "error", "message": "No audio received"})
                         continue
-                    
-                    elif message_type == "stop_recording":
-                        # Process accumulated audio buffer
-                        if not audio_buffer:
-                            await ws.send_json({
-                                "type": "error",
-                                "message": "No audio data received"
-                            })
+
+                    try:
+                        # Final STT
+                        wav = pcm_to_wav(bytes(audio_buffer), sample_rate=SAMPLE_RATE)
+                        transcript = await transcribe_audio_bytes_async(wav)
+                        transcript = (transcript or "").strip()
+
+                        if not transcript:
+                            await _send({"type": "error", "message": "Could not transcribe audio"})
+                            audio_buffer = bytearray()
                             continue
 
-                        try:
-                            # Generate unique session ID for this transaction
-                            session_id = str(uuid.uuid4())
-                            
-                            # Write accumulated audio buffer to file (already in webm format)
-                            temp_input_path = BASE_DIR.parent / f"temp_{session_id}.webm"
-                            with open(temp_input_path, "wb") as f:
-                                f.write(audio_buffer)
-                            
-                            # Clear buffer for next recording
-                            audio_buffer = bytearray()
+                        await _send({"type": "final_transcript", "text": transcript})
 
-                            # STT
-                            transcription = transcribe_audio(str(temp_input_path))
-
-                            await ws.send_json({
-                                "type": "transcription",
-                                "text": transcription
-                            })
-
-                            # Agent
-                            response_text = process_message(transcription)
-
-                            await ws.send_json({
-                                "type": "agent_text",
-                                "text": response_text
-                            })
-
-                            now = datetime.now(timezone.utc)
-                            chat_collection.insert_many([
-                                {"role": "user", "content": transcription, "created_at": now},
-                                {"role": "assistant", "content": response_text, "created_at": now},
-                            ])
-
-                            # TTS
-                            audio_name = f"response_{session_id}.mp3"
-                            audio_path = AUDIO_DIR / audio_name
-                            text_to_speech(response_text, str(audio_path))
-
-                            await ws.send_json({
-                                "type": "audio_ready",
-                                "audio_url": f"/audio/{audio_name}"
-                            })
-
-                        except Exception as e:
-                            # Send error but keep connection alive
-                            await ws.send_json({
-                                "type": "error",
-                                "message": f"Processing failed: {str(e)}"
-                            })
-                        finally:
-                            # Clean up temp file after this transaction
-                            if temp_input_path:
-                                try:
-                                    temp_input_path.unlink(missing_ok=True)
-                                except Exception:
-                                    pass
-                                temp_input_path = None
-                    else:
-                        await ws.send_json({
-                            "type": "error",
-                            "message": "Unsupported control message type"
+                        # Save user message
+                        now = datetime.now(timezone.utc)
+                        chat_messages_collection.insert_one({
+                            "session_id": session_id,
+                            "role": "user",
+                            "content": transcript,
+                            "message_type": "audio_transcript",
+                            "created_at": now,
                         })
-                
-                # Handle binary messages (audio data)
-                elif "bytes" in message:
-                    audio_data = message["bytes"]
-                    # Append to buffer
-                    audio_buffer.extend(audio_data)
 
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                # Log the error
-                error_msg = str(e)
-                print(f"WebSocket error: {error_msg}")
-                
-                # If it's a connection-related error, break the loop
-                if "disconnect" in error_msg.lower() or "connection" in error_msg.lower():
-                    break
-                
-                # Try to send error message, but if it fails, break
-                try:
-                    await ws.send_json({
-                        "type": "error",
-                        "message": "Request processing error"
-                    })
-                except Exception:
-                    # Connection is broken, exit the loop
+                        # Stream assistant response
+                        full_response = ""
+                        async for chunk in process_message_stream(transcript, conversation_history):
+                            full_response += chunk
+                            await _send({"type": "assistant_stream", "text": chunk})
+
+                        await _send({"type": "assistant_done"})
+
+                        # Save assistant message
+                        chat_messages_collection.insert_one({
+                            "session_id": session_id,
+                            "role": "assistant",
+                            "content": full_response,
+                            "message_type": "text",
+                            "created_at": datetime.now(timezone.utc),
+                        })
+
+                        # Update history for multi-turn context
+                        conversation_history.append({"role": "user", "content": transcript})
+                        conversation_history.append({"role": "assistant", "content": full_response})
+
+                    except Exception as exc:
+                        await _send({"type": "error", "message": f"Processing failed: {exc}"})
+                    finally:
+                        audio_buffer = bytearray()
+                        last_partial_time = time.time()
+                    continue
+
+                # ── stop_conversation ──
+                if msg_type == "stop_conversation":
+                    is_active = False
+                    if partial_task and not partial_task.done():
+                        partial_task.cancel()
+                    if session_id:
+                        conversations_collection.update_one(
+                            {"session_id": session_id},
+                            {"$set": {"status": "ended", "ended_at": datetime.now(timezone.utc)}},
+                        )
                     break
 
+            # ── Binary audio chunks ──────────────────────────
+            elif "bytes" in message:
+                if not is_active:
+                    continue
+                audio_buffer.extend(message["bytes"])
+
+                # Fire periodic partial transcription
+                now_ts = time.time()
+                if (now_ts - last_partial_time >= PARTIAL_TRANSCRIPTION_INTERVAL
+                        and len(audio_buffer) > SAMPLE_RATE * 2):  # at least 1s of audio
+                    last_partial_time = now_ts
+                    snapshot = bytes(audio_buffer)
+                    if partial_task and not partial_task.done():
+                        partial_task.cancel()
+                    partial_task = asyncio.create_task(
+                        _run_partial_transcription(snapshot)
+                    )
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[ws] unexpected: {exc}")
     finally:
-        # Final cleanup when connection closes
-        if temp_input_path:
-            try:
-                temp_input_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-    
-# app.mount("/audio", StaticFiles(directory=BASE_DIR.parent / "audio"), name="audio")
+        if partial_task and not partial_task.done():
+            partial_task.cancel()
+        if session_id:
+            conversations_collection.update_one(
+                {"session_id": session_id},
+                {"$set": {"status": "ended", "ended_at": datetime.now(timezone.utc)}},
+            )
+
+
+# ── Static files ─────────────────────────────────────────────
+
 app.mount("/audio", StaticFiles(directory="audio"), name="audio")
