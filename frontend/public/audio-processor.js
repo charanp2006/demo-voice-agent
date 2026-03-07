@@ -4,7 +4,10 @@
  *
  * Messages to main thread:
  *   { type: "audio",  buffer: Float32Array }
- *   { type: "vad",    rms: number }
+ *   { type: "vad",    rms: number, peak: number }
+ *
+ * The `peak` value is the max absolute sample in the frame — useful for the
+ * main-thread VAD to reject isolated spikes that inflate RMS.
  */
 
 class AudioCaptureProcessor extends AudioWorkletProcessor {
@@ -17,10 +20,7 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
     this.ratio      = Math.max(1, Math.round(this.sourceRate / this.targetRate));
 
     // Accumulate ~4096 down-sampled samples before posting (≈ 256 ms at 16 kHz)
-    // this.chunkSize    = 4096;
-
-    // Accumulate ~1024 down-sampled samples before posting (≈ 64 ms at 16 kHz) for lower latency
-    this.chunkSize    = 1024;
+    this.chunkSize    = 4096;
     this.buffer       = new Float32Array(this.chunkSize);
     this.bytesWritten = 0;
   }
@@ -32,10 +32,13 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
     const channelData = input[0]; // mono
     if (!channelData) return true;
 
-    // RMS for VAD (computed on full-rate data)
-    let sum = 0;
+    // RMS + peak for VAD (computed on full-rate data)
+    let sum  = 0;
+    let peak = 0;
     for (let i = 0; i < channelData.length; i++) {
       sum += channelData[i] * channelData[i];
+      const abs = Math.abs(channelData[i]);
+      if (abs > peak) peak = abs;
     }
     const rms = Math.sqrt(sum / channelData.length);
 
@@ -52,8 +55,8 @@ class AudioCaptureProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // Always send RMS so the main thread can run VAD immediately
-    this.port.postMessage({ type: 'vad', rms });
+    // Always send RMS + peak so the main thread can run VAD immediately
+    this.port.postMessage({ type: 'vad', rms, peak });
 
     return true;
   }

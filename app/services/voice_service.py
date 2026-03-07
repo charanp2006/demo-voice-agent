@@ -69,7 +69,8 @@ def text_to_speech(text: str, output_path: str) -> str:
     try:
         audio_gen = eleven_client.text_to_speech.convert(
             text=text,
-            voice_id="SAz9YHcvj6GT2YYXdXww",
+            # voice_id="SAz9YHcvj6GT2YYXdXww",
+            voice_id="nwj0s2LU9bDWRKND5yzA",  # Bunty
             model_id="eleven_turbo_v2",
         )
         audio_content = b"".join(audio_gen)
@@ -87,7 +88,7 @@ def text_to_speech_bytes(text: str) -> bytes:
     try:
         audio_gen = eleven_client.text_to_speech.convert(
             text=text,
-            voice_id="SAz9YHcvj6GT2YYXdXww",
+            voice_id="wvYsNKX8YWSlLtSB2UOH",  # Bunty
             model_id="eleven_turbo_v2",
         )
         return b"".join(audio_gen)

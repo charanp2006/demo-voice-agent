@@ -19,7 +19,9 @@ Server → Client:
 """
 
 import asyncio
+import base64
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +108,35 @@ def chat(request: ChatRequest):
 PARTIAL_TRANSCRIPTION_INTERVAL = 2.0   # seconds between interim STT calls
 SAMPLE_RATE = 16000                     # expected PCM sample rate from client
 
+# ── Server-side transcript filtering (second line of defense) ─
+_HALLUCINATION_RE = [
+    re.compile(r"^thank(?:s| you)\s*(?:for)?\s*(?:watching|listening|viewing)", re.I),
+    re.compile(r"^(?:please\s+)?(?:like|subscribe)", re.I),
+    re.compile(r"^\s*you\s*$", re.I),
+    re.compile(r"^(?:um+|uh+|hmm+|ah+|oh+)\s*\.?\s*$", re.I),
+    re.compile(r"^\[.*\]$"),               # [Music], [Applause]
+    re.compile(r"^\(.*\)$"),               # (upbeat music)
+    re.compile(r"^\s*\.+\s*$"),            # just dots / ellipsis
+    re.compile(r"^bye[\s.!]*$", re.I),
+]
+_MIN_TRANSCRIPT_WORDS = 2
+_MIN_TRANSCRIPT_CHARS = 4
+
+
+def _is_valid_transcript(text: str) -> bool:
+    """Return False for hallucinations, noise artefacts, and very short text."""
+    if not text:
+        return False
+    if len(text) < _MIN_TRANSCRIPT_CHARS:
+        return False
+    if len(text.split()) < _MIN_TRANSCRIPT_WORDS:
+        return False
+    for pat in _HALLUCINATION_RE:
+        if pat.search(text):
+            print(f"[stt-filter] rejected hallucination: {text!r}")
+            return False
+    return True
+
 
 @app.websocket("/ws/voice")
 async def websocket_voice(ws: WebSocket):
@@ -129,7 +160,7 @@ async def websocket_voice(ws: WebSocket):
         try:
             wav = pcm_to_wav(snapshot, sample_rate=SAMPLE_RATE)
             text = await transcribe_audio_bytes_async(wav)
-            if text and text.strip():
+            if text and text.strip() and _is_valid_transcript(text.strip()):
                 await _send({"type": "partial_transcript", "text": text.strip()})
         except Exception as exc:
             print(f"[partial-stt] {exc}")
@@ -165,7 +196,12 @@ async def websocket_voice(ws: WebSocket):
                     if partial_task and not partial_task.done():
                         partial_task.cancel()
 
+                    buf_len = len(audio_buffer)
+                    buf_duration = buf_len / (SAMPLE_RATE * 2)  # 2 bytes per sample
+                    print(f"[ws] end_of_speech — buffer={buf_len} bytes ({buf_duration:.1f}s)")
+
                     if not audio_buffer:
+                        print("[ws] ERROR: empty audio buffer")
                         await _send({"type": "error", "message": "No audio received"})
                         continue
 
@@ -174,8 +210,10 @@ async def websocket_voice(ws: WebSocket):
                         wav = pcm_to_wav(bytes(audio_buffer), sample_rate=SAMPLE_RATE)
                         transcript = await transcribe_audio_bytes_async(wav)
                         transcript = (transcript or "").strip()
+                        print(f"[ws] STT result: {transcript!r}")
 
-                        if not transcript:
+                        if not transcript or not _is_valid_transcript(transcript):
+                            print(f"[ws] Transcript rejected by filter")
                             await _send({"type": "error", "message": "Could not transcribe audio"})
                             audio_buffer = bytearray()
                             continue
@@ -193,12 +231,31 @@ async def websocket_voice(ws: WebSocket):
                         })
 
                         # Stream assistant response
+                        print(f"[ws] Sending to LLM: {transcript!r}")
                         full_response = ""
                         async for chunk in process_message_stream(transcript, conversation_history):
                             full_response += chunk
                             await _send({"type": "assistant_stream", "text": chunk})
 
-                        await _send({"type": "assistant_done"})
+                        print(f"[ws] LLM response length: {len(full_response)} chars")
+
+                        if not full_response.strip():
+                            print("[ws] WARNING: LLM returned empty response")
+                            await _send({"type": "error", "message": "No response generated"})
+                            audio_buffer = bytearray()
+                            continue
+
+                        await _send({"type": "assistant_done", "text": full_response})
+
+                        # Generate TTS audio and send to client
+                        try:
+                            tts_bytes = await text_to_speech_bytes_async(full_response)
+                            audio_b64 = base64.b64encode(tts_bytes).decode("ascii")
+                            await _send({"type": "tts_audio", "audio": audio_b64})
+                            print(f"[ws] TTS sent — {len(tts_bytes)} bytes")
+                        except Exception as tts_exc:
+                            print(f"[ws] TTS failed: {tts_exc}")
+                            await _send({"type": "tts_error", "message": str(tts_exc)})
 
                         # Save assistant message
                         chat_messages_collection.insert_one({
@@ -214,6 +271,7 @@ async def websocket_voice(ws: WebSocket):
                         conversation_history.append({"role": "assistant", "content": full_response})
 
                     except Exception as exc:
+                        print(f"[ws] EXCEPTION in end_of_speech: {exc}")
                         await _send({"type": "error", "message": f"Processing failed: {exc}"})
                     finally:
                         audio_buffer = bytearray()
@@ -236,7 +294,12 @@ async def websocket_voice(ws: WebSocket):
             elif "bytes" in message:
                 if not is_active:
                     continue
+                chunk_len = len(message["bytes"])
                 audio_buffer.extend(message["bytes"])
+                buf_duration = len(audio_buffer) / (SAMPLE_RATE * 2)
+                # Log every ~1 s of accumulated audio
+                if int(buf_duration) != int((len(audio_buffer) - chunk_len) / (SAMPLE_RATE * 2)):
+                    print(f"[ws] Audio buffer: {len(audio_buffer)} bytes ({buf_duration:.1f}s)")
 
                 # Fire periodic partial transcription
                 now_ts = time.time()

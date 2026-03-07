@@ -24,7 +24,7 @@ A real-time, voice-first AI receptionist for a dental clinic. Patients speak nat
 ```mermaid
 graph TB
   subgraph Browser ["Browser (React + Vite)"]
-    MIC["��� Microphone"]
+    MIC["��� Microphone"]
     AW["AudioWorklet<br/>16 kHz PCM"]
     VAD["Energy VAD<br/>(RMS threshold)"]
     UI["Chat UI<br/>Streaming Bubbles"]
@@ -104,9 +104,14 @@ sequenceDiagram
   loop Streaming response
     S->>C: {"type": "assistant_stream", "text": "chunk"}
   end
-  S->>C: {"type": "assistant_done"}
+  S->>C: {"type": "assistant_done", "text": "full response"}
+
+  Note over S: Generate TTS audio
+  S->>C: {"type": "tts_audio", "audio": "base64 MP3"}
+  Note over C: Play audio + reveal words one-by-one
 
   Note over C: User speaks again (loop) or stops
+  Note over C: If user speaks during TTS → barge-in stops playback
   C->>S: {"type": "stop_conversation"}
 ```
 
@@ -122,7 +127,9 @@ sequenceDiagram
 | Server → Client | `partial_transcript` | `text` | Interim STT result |
 | Server → Client | `final_transcript` | `text` | Final STT after end_of_speech |
 | Server → Client | `assistant_stream` | `text` | Streamed LLM response chunk |
-| Server → Client | `assistant_done` | — | Full response delivered |
+| Server → Client | `assistant_done` | `text` | Full response delivered |
+| Server → Client | `tts_audio` | `audio` (base64) | MP3 audio for playback |
+| Server → Client | `tts_error` | `message` | TTS generation failed |
 | Server → Client | `error` | `message` | Error description |
 
 ---
@@ -165,7 +172,7 @@ The tool-calling loop runs up to **3 rounds** (non-streaming) to resolve chained
 
 ```mermaid
 flowchart LR
-  MIC["��� Microphone<br/>48 kHz"] --> WK["AudioWorklet<br/>(audio-processor.js)"]
+  MIC["��� Microphone<br/>48 kHz"] --> WK["AudioWorklet<br/>(audio-processor.js)"]
   WK -->|"Decimation<br/>48→16 kHz"| BUF["Chunk buffer<br/>1024 samples ≈ 64 ms"]
   BUF -->|"Float32→Int16"| PCM["PCM-16 LE bytes"]
   PCM -->|"ws.send(binary)"| SRV["FastAPI<br/>audio_buffer"]
@@ -175,13 +182,25 @@ flowchart LR
 
 ### VAD (Voice Activity Detection)
 
+The VAD uses a **sliding-window ratio-based** approach with multiple noise-rejection layers:
+
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
-| `VAD_SILENCE_THRESHOLD` | 0.008 | RMS energy below this = silence |
-| `VAD_SILENCE_TIMEOUT_MS` | 2500 ms | Consecutive silence to trigger `end_of_speech` |
-| `VAD_SPEECH_MIN_MS` | 500 ms | Minimum speech duration before silence is respected |
+| `CALIBRATION_DURATION_MS` | 2000 ms | Measure ambient noise floor |
+| `NOISE_FLOOR_MULTIPLIER` | 6 | threshold = noise_floor × 6 |
+| `MIN_ABSOLUTE_THRESHOLD` | 0.02 | Hard minimum RMS threshold |
+| `SPEECH_WINDOW_MS` | 400 ms | Sliding window for ratio check |
+| `SPEECH_RATIO` | 0.5 | ≥50% of frames above threshold = speech |
+| `VAD_SILENCE_TIMEOUT_MS` | 2000 ms | Silence to trigger `end_of_speech` |
+| `VAD_SPEECH_MIN_MS` | 600 ms | Minimum speech duration |
+| `MAX_CREST_FACTOR` | 10 | peak/RMS above this = impulsive noise |
+| `RMS_SMOOTHING_ALPHA` | 0.35 | EMA smoothing factor |
+| `PRE_SPEECH_CHUNKS` | 15 | ~3.8 s pre-speech ring buffer |
+| `TTS_INTERRUPT_MULTIPLIER` | 2.5 | Raised threshold during TTS for barge-in |
 
-The AudioWorklet computes RMS on every `process()` call and posts `{type:'vad', rms}` to the main thread. The main thread runs a timer-based state machine: once speech is detected (RMS > threshold), a silence timer starts on the first quiet frame and fires `end_of_speech` after 2.5 s.
+The system calibrates for 2 seconds on start, then uses a sliding window: if ≥50% of VAD frames in 400 ms are above the dynamic threshold, speech is confirmed. A 15-chunk ring buffer preserves the start of utterances. Audio is only sent to the backend when speech is confirmed. During TTS playback, the threshold is elevated ×2.5 to avoid echo while still allowing user interruption.
+
+See `docs/VAD_IMPROVEMENTS.md` for detailed documentation.
 
 ---
 
@@ -259,7 +278,7 @@ erDiagram
 demo/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                  # FastAPI app, WebSocket /ws/voice, REST endpoints
+│   ├── main.py                  # FastAPI app, WebSocket /ws/voice, REST endpoints, TTS delivery
 │   ├── database.py              # MongoDB connection, 7 collections, indexes, seed data
 │   ├── models/
 │   │   └── schema.py            # Pydantic schemas (Patient, Appointment, WSMessage, etc.)
@@ -274,12 +293,14 @@ demo/
 │   ├── package.json             # React 18, Vite, Tailwind CSS 4
 │   ├── vite.config.js
 │   ├── public/
-│   │   └── audio-processor.js   # AudioWorklet processor (16 kHz downsample + VAD RMS)
+│   │   └── audio-processor.js   # AudioWorklet processor (16 kHz downsample + RMS + peak)
 │   └── src/
 │       ├── main.jsx             # React root
-│       ├── App.jsx              # Voice UI: Start/Stop, AudioWorklet, VAD, streaming chat
+│       ├── App.jsx              # Voice UI: VAD, TTS playback, barge-in, debug panel
 │       └── index.css            # Tailwind imports
 ├── audio/                       # Generated TTS audio files (gitignored)
+├── docs/
+│   └── VAD_IMPROVEMENTS.md      # Detailed VAD & TTS documentation
 ├── requirements.txt             # Python dependencies
 ├── ARCHITECTURE.md              # Detailed architecture docs with Mermaid diagrams
 └── .env                         # API keys (not committed)
@@ -340,10 +361,13 @@ The frontend runs at `http://localhost:5173` and connects to the backend at `htt
 ### 5. Use the app
 
 1. Click **"Start Conversation"** — the browser requests microphone access
-2. Speak naturally — the VAD detects speech and silence automatically
-3. After 2.5 s of silence, your speech is transcribed and sent to the AI agent
-4. The agent's response streams in real-time as chat bubbles
-5. Click **"Stop Conversation"** when done
+2. Wait 2 seconds for noise-floor calibration (amber pulsing indicator)
+3. Speak naturally — the VAD detects speech and silence automatically
+4. After 2 s of silence, your speech is transcribed and sent to the AI agent
+5. The assistant responds with **voice (TTS)** — words appear one-by-one as it speaks
+6. **Interrupt anytime** — speak while the assistant is talking to stop it and take over
+7. Click **"Stop Conversation"** when done
+8. Use the **debug panel** (bottom-right toggle) to monitor VAD events in real time
 
 ---
 

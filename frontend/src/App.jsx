@@ -4,9 +4,42 @@ const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 const WS_BASE  = API_BASE.replace(/^http/i, 'ws');
 
 // ── VAD tunables ────────────────────────────────────────────
-const VAD_SILENCE_THRESHOLD  = 0.008;   // RMS below this = silence
-const VAD_SILENCE_TIMEOUT_MS = 2500;    // 2.5 s of silence → end of speech
-const VAD_SPEECH_MIN_MS      = 500;     // ignore silence bursts shorter than this
+// — Noise-floor calibration
+const CALIBRATION_DURATION_MS = 2000;   // measure ambient noise for 2 s
+const NOISE_FLOOR_MULTIPLIER  = 6;      // threshold = noise_floor × this
+const MIN_ABSOLUTE_THRESHOLD  = 0.02;   // hard floor — rejects whispers & low ambient
+
+// — Speech detection  (ratio-based: X of last Y frames must be above threshold)
+const SPEECH_WINDOW_MS        = 400;    // sliding window length
+const SPEECH_RATIO            = 0.5;    // at least 50 % of frames in window must be above
+const VAD_SILENCE_TIMEOUT_MS  = 2000;   // 2 s of silence → end of speech
+const VAD_SPEECH_MIN_MS       = 600;    // total speech must be at least this long
+const MAX_CREST_FACTOR        = 10;     // peak/rms above this = impulsive noise
+
+// — RMS smoothing  (exponential moving average to absorb spikes)
+const RMS_SMOOTHING_ALPHA     = 0.35;   // 0 = heavy smoothing, 1 = raw
+
+// — Pre-speech ring buffer (captures audio before speech is confirmed)
+const PRE_SPEECH_CHUNKS       = 15;     // ~15 × 256 ms ≈ 3.8 s of look-back
+
+// — TTS interrupt threshold multiplier (speech during TTS must be louder to avoid echo)
+const TTS_INTERRUPT_MULTIPLIER = 2.5;  // threshold × this during TTS playback
+
+// — Transcript filtering
+const MIN_TRANSCRIPT_WORDS    = 2;      // ignore transcripts with fewer words
+const MIN_TRANSCRIPT_CHARS    = 4;      // ignore transcripts shorter than this
+
+// — STT hallucination phrases (Whisper outputs these on silence / noise)
+const HALLUCINATION_PATTERNS = [
+  /^thank(s| you)\s*(for)?\s*(watching|listening|viewing)/i,
+  /^(please\s+)?(like|subscribe)/i,
+  /^\s*you\s*$/i,
+  /^(um+|uh+|hmm+|ah+|oh+)\s*\.?\s*$/i,
+  /^\[.*\]$/,                            // [Music], [Applause], etc.
+  /^\(.*\)$/,                            // (upbeat music), etc.
+  /^\s*\.+\s*$/,                         // just dots / ellipsis
+  /^bye[\s.!]*$/i,
+];
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -32,6 +65,7 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [sessionId, setSessionId] = useState(null);
   const [rmsLevel, setRmsLevel]   = useState(0);
+  const [isCalibrating, setIsCalibrating] = useState(false);
 
   // ── Refs ────────────────────────────────────────────────
   const wsRef           = useRef(null);
@@ -44,6 +78,54 @@ export default function App() {
   const activeRef       = useRef(false);
   const chatEndRef      = useRef(null);
   const assistantBuf    = useRef('');
+
+  // Noise-floor calibration refs
+  const calibrationStartRef = useRef(null);  // Date.now() when calibration started
+  const calibrationSamples  = useRef([]);    // RMS samples during calibration
+  const noiseFloorRef       = useRef(0);     // computed noise floor
+  const speechThresholdRef  = useRef(MIN_ABSOLUTE_THRESHOLD); // dynamic threshold
+  const isCalibDoneRef      = useRef(false); // true once calibration is complete
+
+  // Speech-confirmation gate: ratio of above-threshold frames in a sliding window
+  const speechCandidateStartRef = useRef(null); // when first frame exceeded threshold
+  const speechConfirmedRef      = useRef(false); // true once gate passed
+  const vadFrameHistory         = useRef([]);    // recent {ts, above} entries
+
+  // Smoothed RMS (exponential moving average)
+  const smoothedRmsRef = useRef(0);
+
+  // Pre-speech audio ring buffer — stores recent audio chunks so the start
+  // of an utterance is not lost during the confirmation window.
+  const preSpeechBufRef = useRef([]);
+
+  // TTS playback state
+  const [isTTSPlaying, setIsTTSPlaying] = useState(false);
+  const ttsAudioRef    = useRef(null);   // HTMLAudioElement for TTS
+  const ttsTextRef     = useRef('');      // full assistant text during TTS
+  const wordTimerRef   = useRef(null);    // setInterval id for word reveal
+  const ttsBlobUrlRef  = useRef(null);    // object URL to revoke on cleanup
+
+  // Debug log buffer (shown in debug panel)
+  const [debugLogs, setDebugLogs] = useState([]);
+  const debugRef = useRef([]);
+  const debugFlushTimer = useRef(null);
+  const [showDebug, setShowDebug] = useState(false);
+
+  /** Append a debug message (batched to reduce renders) */
+  function dbg(msg) {
+    const entry = `[${new Date().toLocaleTimeString('en-GB', { hour12: false })}] ${msg}`;
+    console.log(`[VAD-DBG] ${msg}`);
+    debugRef.current.push(entry);
+    // Keep last 200 entries
+    if (debugRef.current.length > 200) debugRef.current.shift();
+    // Batch UI updates
+    if (!debugFlushTimer.current) {
+      debugFlushTimer.current = setTimeout(() => {
+        setDebugLogs([...debugRef.current]);
+        debugFlushTimer.current = null;
+      }, 250);
+    }
+  }
 
   // Auto-scroll
   useEffect(() => {
@@ -71,6 +153,63 @@ export default function App() {
       wsRef.current.onclose = null;
       wsRef.current.close();
       wsRef.current = null;
+    }
+
+    // Stop TTS if playing
+    clearInterval(wordTimerRef.current);
+    wordTimerRef.current = null;
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current = null;
+    }
+    if (ttsBlobUrlRef.current) {
+      URL.revokeObjectURL(ttsBlobUrlRef.current);
+      ttsBlobUrlRef.current = null;
+    }
+    ttsTextRef.current = '';
+    setIsTTSPlaying(false);
+
+    // Reset calibration + speech-gate state
+    calibrationStartRef.current     = null;
+    calibrationSamples.current      = [];
+    noiseFloorRef.current           = 0;
+    speechThresholdRef.current      = MIN_ABSOLUTE_THRESHOLD;
+    isCalibDoneRef.current          = false;
+    speechCandidateStartRef.current = null;
+    speechConfirmedRef.current      = false;
+    vadFrameHistory.current         = [];
+    smoothedRmsRef.current          = 0;
+    preSpeechBufRef.current         = [];
+    setIsCalibrating(false);
+  }
+
+  /** Stop TTS playback immediately and finalize partial text into chat */
+  function stopTTS(reason) {
+    dbg(`TTS interrupted: ${reason}`);
+    clearInterval(wordTimerRef.current);
+    wordTimerRef.current = null;
+
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.onended = null;  // prevent onended from firing
+      ttsAudioRef.current.onerror = null;
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current = null;
+    }
+
+    // Commit accumulated text so far to chat history
+    const fullText = ttsTextRef.current;
+    if (fullText.trim()) {
+      setMessages(prev => [...prev, { role: 'assistant', content: fullText }]);
+    }
+    setAssistantText('');
+    assistantBuf.current = '';
+    ttsTextRef.current = '';
+    setIsTTSPlaying(false);
+    setIsProcessing(false);
+
+    if (ttsBlobUrlRef.current) {
+      URL.revokeObjectURL(ttsBlobUrlRef.current);
+      ttsBlobUrlRef.current = null;
     }
   }
 
@@ -119,42 +258,144 @@ export default function App() {
           if (!activeRef.current) return;
 
           if (e.data.type === 'audio') {
-            // Convert & send binary PCM chunk
-            const pcm = float32ToInt16Bytes(e.data.buffer);
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(pcm);
+            if (!isCalibDoneRef.current) return;
+
+            if (speechConfirmedRef.current) {
+              // Speech confirmed — send audio normally
+              const pcm = float32ToInt16Bytes(e.data.buffer);
+              if (ws.readyState === WebSocket.OPEN) ws.send(pcm);
+            } else {
+              // Buffer recent chunks so start of utterance isn't lost
+              preSpeechBufRef.current.push(e.data.buffer);
+              if (preSpeechBufRef.current.length > PRE_SPEECH_CHUNKS) {
+                preSpeechBufRef.current.shift();
+              }
             }
           }
 
           if (e.data.type === 'vad') {
-            const rms = e.data.rms;
+            const rawRms = e.data.rms;
+            const peak   = e.data.peak;
+
+            // EMA smoothing
+            smoothedRmsRef.current =
+              RMS_SMOOTHING_ALPHA * rawRms +
+              (1 - RMS_SMOOTHING_ALPHA) * smoothedRmsRef.current;
+            const rms = smoothedRmsRef.current;
+
             setRmsLevel(rms);
 
-            if (rms > VAD_SILENCE_THRESHOLD) {
-              // Speech detected
-              if (!hasSpeechRef.current) {
+            // ── Phase 1: Noise-floor calibration ──────────
+            if (!isCalibDoneRef.current) {
+              if (!calibrationStartRef.current) {
+                calibrationStartRef.current = Date.now();
+                setIsCalibrating(true);
+                setStatus('Calibrating noise floor… stay quiet.');
+              }
+
+              calibrationSamples.current.push(rawRms);
+
+              if (Date.now() - calibrationStartRef.current >= CALIBRATION_DURATION_MS) {
+                const samples = calibrationSamples.current;
+                const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+                noiseFloorRef.current = avg;
+                speechThresholdRef.current = Math.max(
+                  avg * NOISE_FLOOR_MULTIPLIER,
+                  MIN_ABSOLUTE_THRESHOLD,
+                );
+                isCalibDoneRef.current = true;
+                setIsCalibrating(false);
+                setStatus('Listening… speak naturally.');
+                dbg(`Calibration done — floor=${avg.toFixed(5)}, threshold=${speechThresholdRef.current.toFixed(5)}`);
+              }
+              return;
+            }
+
+            // ── Phase 2: Speech detection (sliding-window ratio) ──
+            // During TTS, raise the threshold to avoid echo triggering VAD
+            const isTTSActive = ttsAudioRef.current && !ttsAudioRef.current.paused;
+            const threshold = speechThresholdRef.current * (isTTSActive ? TTS_INTERRUPT_MULTIPLIER : 1);
+            const crestFactor = rms > 0.001 ? peak / rms : 0;
+            const isImpulsive = crestFactor > MAX_CREST_FACTOR;
+            const frameAbove  = rms > threshold && !isImpulsive;
+
+            // Record frame in sliding window
+            const now = Date.now();
+            vadFrameHistory.current.push({ ts: now, above: frameAbove });
+
+            // Trim window to SPEECH_WINDOW_MS
+            const cutoff = now - SPEECH_WINDOW_MS;
+            while (vadFrameHistory.current.length > 0 && vadFrameHistory.current[0].ts < cutoff) {
+              vadFrameHistory.current.shift();
+            }
+
+            // Compute ratio of above-threshold frames in window
+            const totalFrames = vadFrameHistory.current.length;
+            const aboveFrames = vadFrameHistory.current.filter(f => f.above).length;
+            const ratio = totalFrames > 0 ? aboveFrames / totalFrames : 0;
+            const speechDetected = ratio >= SPEECH_RATIO;
+
+            if (speechDetected) {
+              if (!speechCandidateStartRef.current) {
+                speechCandidateStartRef.current = now;
+              }
+
+              if (!speechConfirmedRef.current) {
+                // If TTS is playing, interrupt it first
+                if (ttsAudioRef.current && !ttsAudioRef.current.paused) {
+                  stopTTS('user started speaking');
+                }
+
+                // Confirm immediately once sliding window agrees
+                speechConfirmedRef.current = true;
                 hasSpeechRef.current = true;
-                speechStartRef.current = Date.now();
+                speechStartRef.current = now;
                 setIsSpeaking(true);
                 setStatus('Listening…');
+                dbg(`Speech CONFIRMED — ratio=${ratio.toFixed(2)}, rms=${rms.toFixed(4)}, ` +
+                    `threshold=${threshold.toFixed(4)}, prebuf=${preSpeechBufRef.current.length} chunks`);
+
+                // Flush pre-speech buffer → backend gets the start of the utterance
+                const flushed = preSpeechBufRef.current.length;
+                for (const chunk of preSpeechBufRef.current) {
+                  const pcm = float32ToInt16Bytes(chunk);
+                  if (ws.readyState === WebSocket.OPEN) ws.send(pcm);
+                }
+                preSpeechBufRef.current = [];
+                dbg(`Flushed ${flushed} pre-speech chunks (≈${(flushed * 256).toFixed(0)} ms)`);
               }
-              // Reset silence timer
+
+              // Cancel any pending silence timer
               clearTimeout(silenceTimerRef.current);
               silenceTimerRef.current = null;
-            } else if (hasSpeechRef.current && !silenceTimerRef.current) {
-              // Start silence countdown
+
+            } else if (speechConfirmedRef.current && !silenceTimerRef.current) {
+              // Speech was confirmed but now window says silence → start countdown
+              dbg(`Silence detected — starting ${VAD_SILENCE_TIMEOUT_MS} ms countdown`);
               silenceTimerRef.current = setTimeout(() => {
-                const speechDuration = Date.now() - (speechStartRef.current || 0);
-                if (speechDuration >= VAD_SPEECH_MIN_MS && activeRef.current) {
-                  // Silence confirmed → end of speech
+                const dur = Date.now() - (speechStartRef.current || 0);
+                if (dur >= VAD_SPEECH_MIN_MS && activeRef.current) {
+                  dbg(`End-of-speech sent (duration=${dur} ms)`);
                   hasSpeechRef.current = false;
+                  speechConfirmedRef.current = false;
+                  speechCandidateStartRef.current = null;
+                  vadFrameHistory.current = [];
+                  preSpeechBufRef.current = [];
                   setIsSpeaking(false);
                   setIsProcessing(true);
                   setStatus('Processing your speech…');
-
                   if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: 'end_of_speech' }));
                   }
+                } else {
+                  dbg(`Discarded short speech (duration=${dur} ms < ${VAD_SPEECH_MIN_MS})`);
+                  hasSpeechRef.current = false;
+                  speechConfirmedRef.current = false;
+                  speechCandidateStartRef.current = null;
+                  vadFrameHistory.current = [];
+                  preSpeechBufRef.current = [];
+                  setIsSpeaking(false);
+                  setStatus('Listening… speak naturally.');
                 }
                 silenceTimerRef.current = null;
               }, VAD_SILENCE_TIMEOUT_MS);
@@ -178,35 +419,202 @@ export default function App() {
       switch (data.type) {
         case 'conversation_started':
           setSessionId(data.session_id);
+          dbg(`Session started: ${data.session_id}`);
           break;
 
         case 'partial_transcript':
           setUserText(data.text || '');
+          dbg(`Partial transcript: "${data.text}"`);
           break;
 
-        case 'final_transcript':
+        case 'final_transcript': {
+          const text = (data.text || '').trim();
+          const wordCount = text.split(/\s+/).filter(Boolean).length;
+          dbg(`Final transcript: "${text}" (${wordCount} words, ${text.length} chars)`);
+
+          // Reject short transcripts
+          if (text.length < MIN_TRANSCRIPT_CHARS || wordCount < MIN_TRANSCRIPT_WORDS) {
+            dbg(`REJECTED short transcript`);
+            setUserText('');
+            setIsProcessing(false);
+            hasSpeechRef.current = false;
+            speechConfirmedRef.current = false;
+            speechCandidateStartRef.current = null;
+            vadFrameHistory.current = [];
+            preSpeechBufRef.current = [];
+            setStatus('Listening… speak naturally.');
+            break;
+          }
+
+          // Reject known STT hallucination patterns
+          if (HALLUCINATION_PATTERNS.some(re => re.test(text))) {
+            dbg(`REJECTED hallucination: "${text}"`);
+            setUserText('');
+            setIsProcessing(false);
+            hasSpeechRef.current = false;
+            speechConfirmedRef.current = false;
+            speechCandidateStartRef.current = null;
+            vadFrameHistory.current = [];
+            preSpeechBufRef.current = [];
+            setStatus('Listening… speak naturally.');
+            break;
+          }
+
           setUserText('');
-          setMessages(prev => [...prev, { role: 'user', content: data.text }]);
+          setMessages(prev => [...prev, { role: 'user', content: text }]);
           setAssistantText('');
           assistantBuf.current = '';
           break;
+        }
 
         case 'assistant_stream':
           assistantBuf.current += (data.text || '');
-          setAssistantText(assistantBuf.current);
+          // Don't show streaming text — it will be revealed word-by-word during TTS
           break;
 
-        case 'assistant_done':
-          setMessages(prev => [...prev, { role: 'assistant', content: assistantBuf.current }]);
+        case 'assistant_done': {
+          const resp = (data.text || assistantBuf.current).trim();
+          dbg(`Assistant done — length=${resp.length} chars`);
+          if (!resp) {
+            dbg(`WARNING: assistant response was empty`);
+            assistantBuf.current = '';
+            setAssistantText('');
+            setIsProcessing(false);
+            setStatus('Listening… speak naturally.');
+          } else {
+            // Save text; wait for tts_audio to start word-by-word reveal
+            ttsTextRef.current = resp;
+            setStatus('Generating voice…');
+            dbg('Waiting for TTS audio…');
+          }
+          break;
+        }
+
+        case 'tts_audio': {
+          const fullText = ttsTextRef.current;
+          if (!fullText) {
+            dbg('tts_audio received but no text stored — skipping');
+            break;
+          }
+
+          dbg(`TTS audio received (${data.audio.length} b64 chars)`);
+
+          // Decode base64 → Blob → Object URL
+          const raw = atob(data.audio);
+          const arr = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+          const blob = new Blob([arr], { type: 'audio/mpeg' });
+          const url  = URL.createObjectURL(blob);
+          ttsBlobUrlRef.current = url;
+
+          const audio = new Audio(url);
+          ttsAudioRef.current = audio;
+
+          const words = fullText.split(/\s+/).filter(Boolean);
+          let revealIdx = 0;
+
+          setIsProcessing(false);
+          setIsTTSPlaying(true);
+          setAssistantText('');
+          setStatus('Assistant is speaking…');
+
+          audio.onloadedmetadata = () => {
+            const dur = audio.duration; // seconds
+            const interval = (dur * 1000) / words.length;
+            dbg(`TTS duration=${dur.toFixed(2)}s, words=${words.length}, interval=${interval.toFixed(0)}ms`);
+
+            wordTimerRef.current = setInterval(() => {
+              revealIdx++;
+              setAssistantText(words.slice(0, revealIdx).join(' '));
+              if (revealIdx >= words.length) {
+                clearInterval(wordTimerRef.current);
+                wordTimerRef.current = null;
+              }
+            }, interval);
+          };
+
+          audio.onended = () => {
+            dbg('TTS playback ended');
+            clearInterval(wordTimerRef.current);
+            wordTimerRef.current = null;
+
+            // Finalize: add full message to chat, reset state
+            setMessages(prev => [...prev, { role: 'assistant', content: fullText }]);
+            setAssistantText('');
+            assistantBuf.current = '';
+            ttsTextRef.current = '';
+            setIsTTSPlaying(false);
+            setIsProcessing(false);
+            hasSpeechRef.current = false;
+            speechConfirmedRef.current = false;
+            speechCandidateStartRef.current = null;
+            vadFrameHistory.current = [];
+            preSpeechBufRef.current = [];
+            setStatus('Listening… speak naturally.');
+
+            // Clean up blob URL
+            URL.revokeObjectURL(url);
+            ttsBlobUrlRef.current = null;
+            ttsAudioRef.current = null;
+          };
+
+          audio.onerror = (err) => {
+            dbg(`TTS audio playback error: ${err}`);
+            // Fallback: show full text immediately
+            setMessages(prev => [...prev, { role: 'assistant', content: fullText }]);
+            setAssistantText('');
+            assistantBuf.current = '';
+            ttsTextRef.current = '';
+            setIsTTSPlaying(false);
+            setIsProcessing(false);
+            setStatus('Listening… speak naturally.');
+            URL.revokeObjectURL(url);
+            ttsBlobUrlRef.current = null;
+            ttsAudioRef.current = null;
+          };
+
+          audio.play().catch(err => {
+            dbg(`TTS play() failed: ${err}`);
+            // Autoplay blocked or error — show text immediately
+            setMessages(prev => [...prev, { role: 'assistant', content: fullText }]);
+            setAssistantText('');
+            assistantBuf.current = '';
+            ttsTextRef.current = '';
+            setIsTTSPlaying(false);
+            setIsProcessing(false);
+            setStatus('Listening… speak naturally.');
+          });
+          break;
+        }
+
+        case 'tts_error': {
+          dbg(`TTS error from server: ${data.message}`);
+          // Fallback: show the full text without audio
+          const fallbackText = ttsTextRef.current || assistantBuf.current;
+          if (fallbackText.trim()) {
+            setMessages(prev => [...prev, { role: 'assistant', content: fallbackText.trim() }]);
+          }
           setAssistantText('');
           assistantBuf.current = '';
+          ttsTextRef.current = '';
           setIsProcessing(false);
           hasSpeechRef.current = false;
+          speechConfirmedRef.current = false;
+          speechCandidateStartRef.current = null;
+          vadFrameHistory.current = [];
+          preSpeechBufRef.current = [];
           setStatus('Listening… speak naturally.');
           break;
+        }
 
         case 'error':
+          dbg(`SERVER ERROR: ${data.message}`);
           setIsProcessing(false);
+          hasSpeechRef.current = false;
+          speechConfirmedRef.current = false;
+          speechCandidateStartRef.current = null;
+          vadFrameHistory.current = [];
+          preSpeechBufRef.current = [];
           setStatus(`Error: ${data.message}`);
           setTimeout(() => {
             if (activeRef.current) setStatus('Listening… speak naturally.');
@@ -299,10 +707,13 @@ export default function App() {
           </div>
         )}
 
-        {/* Live assistant response (streaming) */}
+        {/* Live assistant response (TTS word-by-word or streaming) */}
         {assistantText && (
           <div className="flex justify-start">
             <div className="max-w-[80%] rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-slate-800 shadow-sm">
+              {isTTSPlaying && (
+                <span className="mr-1.5 inline-block align-middle animate-pulse">🔊</span>
+              )}
               {assistantText}
               <span className="ml-1 inline-block animate-pulse">▎</span>
             </div>
@@ -334,27 +745,67 @@ export default function App() {
           <div className="relative flex items-center justify-center">
             <div
               className={`h-16 w-16 rounded-full transition-all duration-150 ${
-                isSpeaking
-                  ? 'bg-emerald-500 shadow-lg shadow-emerald-300'
-                  : 'bg-slate-300'
+                isCalibrating
+                  ? 'bg-amber-400 shadow-lg shadow-amber-200 animate-pulse'
+                  : isTTSPlaying
+                    ? 'bg-violet-500 shadow-lg shadow-violet-300 animate-pulse'
+                    : isSpeaking
+                      ? 'bg-emerald-500 shadow-lg shadow-emerald-300'
+                      : 'bg-slate-300'
               }`}
               style={{
-                transform: `scale(${1 + Math.min(rmsLevel * 15, 0.6)})`,
+                transform: `scale(${isTTSPlaying ? 1.15 : 1 + Math.min(rmsLevel * 15, 0.6)})`,
               }}
             />
             <div className="absolute inset-0 flex items-center justify-center">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white" className="h-7 w-7">
-                <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" />
-                <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.93V21h-2a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-3.07A7 7 0 0 0 19 11Z" />
-              </svg>
+              {isTTSPlaying ? (
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white" className="h-7 w-7">
+                  <path d="M11.383 3.076A1 1 0 0 1 12 4v16a1 1 0 0 1-1.707.707L5.586 16H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h1.586l4.707-4.707a1 1 0 0 1 1.09-.217Z" />
+                  <path d="M16 7.5a6.5 6.5 0 0 1 0 9" strokeWidth="2" stroke="white" fill="none" />
+                  <path d="M19 5a10 10 0 0 1 0 14" strokeWidth="2" stroke="white" fill="none" />
+                </svg>
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white" className="h-7 w-7">
+                  <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" />
+                  <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.93V21h-2a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-3.07A7 7 0 0 0 19 11Z" />
+                </svg>
+              )}
             </div>
           </div>
 
           <p className="text-xs text-slate-500">
-            {isSpeaking ? 'Listening…' : isProcessing ? 'Processing…' : 'Waiting for speech'}
+            {isCalibrating ? 'Calibrating…' : isTTSPlaying ? 'Speaking…' : isSpeaking ? 'Listening…' : isProcessing ? 'Processing…' : 'Waiting for speech'}
           </p>
         </footer>
       )}
+
+      {/* ── Debug panel (collapsible) ──────────────────── */}
+      <div className="fixed bottom-0 right-0 z-50 w-96 max-w-full">
+        <button
+          onClick={() => setShowDebug(d => !d)}
+          className="ml-auto block rounded-tl-lg bg-slate-800 px-3 py-1 text-xs font-mono text-slate-300 hover:bg-slate-700"
+        >
+          {showDebug ? '▼ Hide Debug' : '▲ Show Debug'}
+        </button>
+        {showDebug && (
+          <div className="h-64 overflow-y-auto bg-slate-900 p-2 text-[10px] leading-relaxed font-mono text-green-400 border-t border-slate-700">
+            {debugLogs.length === 0 && (
+              <p className="text-slate-500">No debug events yet. Start a conversation.</p>
+            )}
+            {debugLogs.map((line, i) => (
+              <div key={i} className={
+                line.includes('ERROR') || line.includes('REJECTED') || line.includes('WARNING')
+                  ? 'text-red-400'
+                  : line.includes('CONFIRMED') || line.includes('done')
+                    ? 'text-emerald-400'
+                    : ''
+              }>
+                {line}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </main>
   );
 }
