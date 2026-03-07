@@ -1,6 +1,6 @@
 # SmileCare Dental Clinic – AI Voice Assistant
 
-A real-time, voice-first AI receptionist for a dental clinic. Patients speak naturally into their browser; the system transcribes speech via **Deepgram Nova-3**, reasons and executes clinic operations through **Groq Llama 3.3 70B** function-calling, and speaks back via **Deepgram Aura TTS** — all over a single WebSocket connection with per-stage latency measurement.
+A real-time, voice-first AI receptionist for a dental clinic. Patients speak naturally into their browser; the system transcribes speech via **Deepgram Nova-3**, reasons and executes clinic operations through **Groq Llama 3.3 70B** function-calling, and speaks back via **Deepgram Aura TTS**. Supports two transport modes: a custom **WebSocket** pipeline with per-stage latency measurement, and **Vapi WebRTC** for fully managed low-latency voice streaming.
 
 ---
 
@@ -8,9 +8,11 @@ A real-time, voice-first AI receptionist for a dental clinic. Patients speak nat
 
 - [Architecture Overview](#architecture-overview)
 - [Tech Stack](#tech-stack)
+- [Transport Modes](#transport-modes)
 - [WebSocket Protocol](#websocket-protocol)
 - [Agent & Tool Calling](#agent--tool-calling)
 - [Audio Pipeline](#audio-pipeline)
+- [Latency Debug](#latency-debug)
 - [Database Schema](#database-schema)
 - [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
@@ -73,6 +75,26 @@ graph TB
 | **TTS** | Deepgram Aura (aura-asteria-en) | Text-to-speech (REST via httpx, MP3) |
 | **Database** | MongoDB (pymongo) | 7 collections for full dental clinic data |
 | **Audio** | Web AudioWorklet API | Low-latency 16 kHz PCM capture + VAD |
+
+---
+
+## Transport Modes
+
+SmileCare supports two transport modes for voice conversations:
+
+| Feature | WebSocket Mode | Vapi WebRTC Mode |
+|---------|---------------|-----------------|
+| **Transport** | WebSocket (`ws://`) | WebRTC (peer-to-peer) |
+| **Pipeline** | Custom (our server handles STT/LLM/TTS) | Fully managed (Vapi cloud) |
+| **STT** | Deepgram Nova-3 | Deepgram Nova-2 (Vapi) |
+| **LLM** | Groq Llama 3.3 70B | Groq Llama 3.3 70B (Vapi) |
+| **TTS** | Deepgram Aura | Deepgram Aura Asteria (Vapi) |
+| **VAD** | Client-side sliding-window | Vapi server-side |
+| **Latency debug** | Full per-stage + client round-trip | Tool execution timing + call report |
+| **Tool execution** | Direct (in-process) | Webhook (`POST /vapi/webhook`) |
+| **Required keys** | `GROQ_API_KEY`, `DEEPGRAM_API_KEY` | `VAPI_PUBLIC_KEY` |
+
+Switch modes via the toggle in the header before starting a conversation. See `docs/VAPI_WEBRTC.md` for full Vapi integration details.
 
 ---
 
@@ -205,6 +227,45 @@ See `docs/VAD_IMPROVEMENTS.md` for detailed documentation.
 
 ---
 
+## Latency Debug
+
+Every voice turn is instrumented with per-stage latency measurement on both the server and client:
+
+### Server-Side (Backend Logs)
+
+All latency logs use the `[LATENCY]` prefix for easy filtering:
+
+```bash
+uvicorn app.main:app --reload 2>&1 | grep "[LATENCY]"
+```
+
+After each turn, the backend prints a summary:
+
+```
+[LATENCY][PIPELINE] ══════════════════════════════
+[LATENCY][PIPELINE]  STT:     342 ms  (22%)  [wav=2ms + api=340ms]
+[LATENCY][PIPELINE]  LLM:     920 ms  (60%)  [first_token=180ms, 8 chunks]
+[LATENCY][PIPELINE]  TTS:     280 ms  (18%)  [18432 bytes MP3]
+[LATENCY][PIPELINE]  TOTAL:  1542 ms  (audio captured: 2.1s)
+[LATENCY][PIPELINE] ══════════════════════════════
+```
+
+### Client-Side (Debug Panel)
+
+The debug panel (bottom-right toggle) shows:
+
+- **Server metrics**: Color-coded per-stage latency with sub-stage breakdown (WAV conversion, API calls, chunk counts, MP3 size)
+- **Client round-trip**: Browser-measured timing from `end_of_speech` → `final_transcript` → first stream → TTS audio, plus network overhead
+- **Running averages**: Average pipeline time over the last 20 turns
+
+### Vapi Webhook Latency
+
+Tool execution time is logged with `[LATENCY][VAPI]` prefix for webhook-based tool calls.
+
+See `docs/LATENCY_DEBUG.md` for a comprehensive guide on interpreting latency data, color codes, and optimization targets.
+
+---
+
 ## Database Schema
 
 ```mermaid
@@ -279,30 +340,34 @@ erDiagram
 demo/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                  # FastAPI app, WebSocket /ws/voice, REST endpoints, TTS delivery
+│   ├── main.py                  # FastAPI app, WebSocket /ws/voice, REST endpoints, latency debug
 │   ├── database.py              # MongoDB connection, 7 collections, indexes, seed data
 │   ├── models/
 │   │   └── schema.py            # Pydantic schemas (Patient, Appointment, WSMessage, etc.)
 │   ├── routers/
-│   │   └── clinic.py            # REST CRUD: /appointments, /services, /dentists, /dashboard
+│   │   ├── clinic.py            # REST CRUD: /appointments, /services, /dentists, /dashboard
+│   │   └── vapi_webhook.py      # Vapi server-URL webhook: POST /vapi/webhook (tool execution)
 │   └── services/
 │       ├── agent_service.py     # SmileCare AI agent, tool handlers, dental scope validation
 │       ├── llm_service.py       # Groq Llama 3 client, 8 JSON-schema tools, streaming generator
 │       └── voice_service.py     # Deepgram Nova-3 STT, Deepgram Aura TTS, pcm_to_wav
 ├── frontend/
 │   ├── index.html
-│   ├── package.json             # React 18, Vite, Tailwind CSS 4
+│   ├── package.json             # React 18, Vite, Tailwind CSS 4, @vapi-ai/web
 │   ├── vite.config.js
 │   ├── public/
 │   │   └── audio-processor.js   # AudioWorklet processor (16 kHz downsample + RMS + peak)
 │   └── src/
 │       ├── main.jsx             # React root
-│       ├── App.jsx              # Voice UI: VAD, TTS playback, barge-in, debug panel
+│       ├── App.jsx              # Voice UI: VAD, TTS, barge-in, debug panel, Vapi WebRTC mode
 │       └── index.css            # Tailwind imports
 ├── audio/                       # Generated TTS audio files (gitignored)
 ├── docs/
 │   ├── ARCHITECTURE.md          # Detailed architecture docs with Mermaid diagrams
+│   ├── LATENCY_DEBUG.md         # Latency debug guide: interpreting metrics & optimization
+│   ├── VAPI_WEBRTC.md           # Vapi WebRTC integration: architecture, config, events
 │   └── VAD_IMPROVEMENTS.md      # Detailed VAD & TTS documentation
+├── .env.example                 # Backend environment template
 ├── requirements.txt             # Python dependencies
 └── .env                         # API keys (not committed)
 ```
@@ -340,6 +405,10 @@ Create a `.env` file in the project root:
 GROQ_API_KEY=your_groq_api_key
 DEEPGRAM_API_KEY=your_deepgram_api_key
 MONGO_URI=mongodb://localhost:27017
+
+# Vapi WebRTC mode (optional — only needed for Vapi transport)
+VAPI_PUBLIC_KEY=your_vapi_public_key
+
 # Optional (commented-out providers in code):
 # GOOGLE_API_KEY=your_gemini_api_key
 # ELEVEN_API_KEY=your_elevenlabs_api_key
@@ -382,6 +451,7 @@ The frontend runs at `http://localhost:5173` and connects to the backend at `htt
 | `GROQ_API_KEY` | Yes | Groq API key (Llama 3.3 70B LLM) |
 | `DEEPGRAM_API_KEY` | Yes | Deepgram API key (Nova-3 STT + Aura TTS) |
 | `MONGO_URI` | Yes | MongoDB connection string |
+| `VAPI_PUBLIC_KEY` | No | Vapi public key (for WebRTC mode) |
 | `GOOGLE_API_KEY` | No | Google Gemini API key (commented-out provider) |
 | `ELEVEN_API_KEY` | No | ElevenLabs API key (commented-out provider) |
 
@@ -393,7 +463,13 @@ The frontend runs at `http://localhost:5173` and connects to the backend at `htt
 
 | Endpoint | Description |
 |----------|-------------|
-| `ws://localhost:8000/ws/voice` | Real-time voice conversation |
+| `ws://localhost:8000/ws/voice` | Real-time voice conversation (WebSocket mode) |
+
+### Vapi Webhook
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/vapi/webhook` | Vapi server-URL webhook for tool execution (WebRTC mode) |
 
 ### REST
 

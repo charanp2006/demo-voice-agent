@@ -1,12 +1,13 @@
 # SmileCare – Frontend
 
-React 18 voice-first frontend for the SmileCare Dental Clinic AI assistant. Uses the **AudioWorklet API** for low-latency microphone capture, client-side **energy-based VAD** for automatic speech boundary detection, and a persistent **WebSocket** to stream audio and receive AI responses in real time.
+React 18 voice-first frontend for the SmileCare Dental Clinic AI assistant. Supports two transport modes: a custom **WebSocket** pipeline with AudioWorklet-based VAD, and **Vapi WebRTC** for fully managed low-latency voice streaming. Features per-stage latency measurement, a real-time debug panel, and TTS word-by-word playback with barge-in.
 
 ---
 
 ## Table of Contents
 
 - [Architecture](#architecture)
+- [Transport Modes](#transport-modes)
 - [Audio Pipeline](#audio-pipeline)
 - [VAD (Voice Activity Detection)](#vad-voice-activity-detection)
 - [WebSocket Client Protocol](#websocket-client-protocol)
@@ -46,9 +47,50 @@ graph LR
 
 ### Two-button Interface + Info Button
 
-The UI has only **two controls**: **Start Conversation** and **Stop Conversation**. There is no separate mic toggle and no text input. Speech boundaries are detected automatically by the VAD.
+The UI has only **two controls**: **Start Conversation** and **Stop Conversation**, plus a **mode toggle** (WebSocket / Vapi WebRTC) visible before starting. There is no separate mic toggle and no text input. Speech boundaries are detected automatically by the VAD (WebSocket mode) or by Vapi (WebRTC mode).
 
-A **floating info button** (blue circle, bottom-right) opens a modal with clinic details, services, departments, dentists, and the AI assistant’s capabilities.
+A **floating info button** (blue circle, bottom-right) opens a modal with clinic details, services, departments, dentists, and the AI assistant's capabilities.
+
+---
+
+## Transport Modes
+
+### WebSocket Mode (Default)
+
+Custom pipeline — mic audio flows through AudioWorklet → VAD → WebSocket to our FastAPI backend, which handles STT (Deepgram Nova-3), LLM (Groq Llama 3.3), and TTS (Deepgram Aura).
+
+### Vapi WebRTC Mode
+
+Fully managed pipeline — uses the `@vapi-ai/web` SDK to establish a WebRTC connection to Vapi cloud. Vapi handles STT, LLM, and TTS; only tool calls hit our backend via webhook.
+
+```mermaid
+graph LR
+  subgraph Browser
+    SDK["@vapi-ai/web SDK"]
+    UI2["React Chat UI"]
+  end
+
+  subgraph VapiCloud["Vapi Cloud"]
+    WEBRTC["WebRTC"]
+    STT2["Deepgram Nova-2"]
+    LLM2["Groq Llama 3.3"]
+    TTS2["Deepgram Aura"]
+  end
+
+  subgraph Backend
+    WH["POST /vapi/webhook"]
+  end
+
+  SDK <-->|"WebRTC"| WEBRTC
+  WEBRTC --> STT2 --> LLM2
+  LLM2 -->|"tool call"| WH
+  WH -->|"result"| LLM2
+  LLM2 --> TTS2
+  TTS2 -->|"audio"| WEBRTC
+  SDK --> UI2
+```
+
+See `docs/VAPI_WEBRTC.md` for full integration details.
 
 ---
 
@@ -217,10 +259,21 @@ The entire frontend is a single `App.jsx` component with these visual sections:
 
 ### Debug Panel
 - Collapsible panel at bottom-right (▲ Show Debug / ▼ Hide Debug)
-- Timestamped, color-coded log entries (red for errors, green for confirmations)
+- Timestamped, color-coded log entries (red for errors, green for confirmations, cyan for latency)
 - Shows VAD events, transcript decisions, TTS events
-- **Latency Dashboard**: color-coded per-stage metrics (green ≤300ms, yellow ≤800ms, red >800ms) with running averages
+- **Latency Dashboard** (server metrics): color-coded per-stage timing with sub-stage breakdown
+  - STT: total + PCM→WAV conversion + Deepgram API call
+  - LLM: first token + total + chunk count
+  - TTS: total + MP3 audio size (KB)
+  - Total pipeline with percentage breakdown
+- **Client Round-Trip** section: browser-measured timing
+  - `end_of_speech` → `final_transcript` (STT + network)
+  - `end_of_speech` → first `assistant_stream` (STT + LLM TTFB + network)
+  - `end_of_speech` → `tts_audio` (full round-trip)
+  - Network overhead (client round-trip − server pipeline)
+- Running averages over last 20 turns
 - Also logs to browser console with `[VAD-DBG]` prefix
+- See `docs/LATENCY_DEBUG.md` for interpreting metrics
 
 ### Floating Info Button
 - Fixed blue circle at bottom-right (z-index 40)
@@ -252,8 +305,9 @@ All state is managed with React hooks (`useState`, `useRef`, `useCallback`):
 | `isCalibrating` | `boolean` | Noise-floor calibration in progress |
 | `debugLogs` | `string[]` | Debug panel log entries |
 | `showDebug` | `boolean` | Debug panel visibility |
-| `latencyData` | `object\|null` | Latest pipeline latency metrics (stt_ms, llm_first_token_ms, etc.) |
+| `latencyData` | `object\|null` | Latest pipeline latency metrics (server + client round-trip) |
 | `showInfo` | `boolean` | Info modal visibility |
+| `mode` | `'websocket'\|'vapi'` | Active transport mode |
 
 ### Refs
 
@@ -282,6 +336,9 @@ All state is managed with React hooks (`useState`, `useRef`, `useCallback`):
 | `wordTimerRef` | setInterval ID for word reveal |
 | `ttsBlobUrlRef` | Object URL for TTS audio blob |
 | `latencyHistoryRef` | Array of past latency measurements for running averages |
+| `clientTimingRef` | Client-side round-trip timestamps (end_of_speech → events) |
+| `vapiRef` | Vapi SDK instance (WebRTC mode) |
+| `vapiActiveRef` | Boolean — prevents stale closure issues in Vapi callbacks |
 
 ---
 
@@ -332,12 +389,14 @@ npm run preview
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VITE_API_BASE` | `http://localhost:8000` | Backend URL (auto-derives WS URL) |
+| `VITE_API_BASE` | `http://localhost:8000` | Backend URL (auto-derives WS URL and Vapi webhook URL) |
+| `VITE_VAPI_PUBLIC_KEY` | *(none)* | Vapi public key for WebRTC mode (optional) |
 
 Set via `.env` in the `frontend/` directory:
 
 ```env
 VITE_API_BASE=http://localhost:8000
+VITE_VAPI_PUBLIC_KEY=your-vapi-public-key   # optional, for Vapi WebRTC mode
 ```
 
 The WebSocket URL is derived automatically by replacing `http` with `ws`:
@@ -353,6 +412,7 @@ const WS_BASE  = API_BASE.replace(/^http/i, 'ws');
 
 | Package | Version | Purpose |
 |---------|---------|---------|
+| `@vapi-ai/web` | ^2.x | Vapi WebRTC SDK for voice streaming |
 | `react` | ^18.3.1 | UI framework |
 | `react-dom` | ^18.3.1 | React DOM renderer |
 | `tailwindcss` | ^4.2.1 | Utility-first CSS |

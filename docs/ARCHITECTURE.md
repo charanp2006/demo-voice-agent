@@ -24,6 +24,7 @@ graph TB
         LLM["Groq Llama 3.3 70B<br/>+ Function Calling"]
         TTS_GEN["TTS Generation<br/>Deepgram Aura"]
         TOOLS["Tool Handlers<br/>check_slots · book · cancel<br/>reschedule · services · info<br/>dentists · patient_appts"]
+        VAPI_WH["Vapi Webhook<br/>POST /vapi/webhook"]
     end
 
     subgraph DB["MongoDB"]
@@ -53,6 +54,7 @@ graph TB
     WSH -->|"tts_audio"| TTS_P
     TTS_P -->|"🔊 audio + word reveal"| SD
     TTS_P -.->|"Barge-in<br/>(user speaks)"| VAD_FE
+    VAPI_WH -->|"tool dispatch"| TOOLS
 
     style Frontend fill:#e0f2fe,stroke:#0284c7
     style Backend fill:#f0fdf4,stroke:#16a34a
@@ -622,11 +624,116 @@ Open **http://localhost:5173** → click **Start Conversation** → speak.
 
 | Layer | Technology |
 |-------|-----------|
-| Frontend | React 18, Vite, Tailwind CSS 4, AudioWorklet API |
+| Frontend | React 18, Vite, Tailwind CSS 4, AudioWorklet API, @vapi-ai/web |
 | WebSocket | Native WebSocket (browser) ↔ FastAPI WebSocket |
+| WebRTC | @vapi-ai/web SDK ↔ Vapi Cloud |
 | Backend | FastAPI (Python), asyncio |
 | STT | Deepgram Nova-3 (REST via httpx) |
 | LLM | Groq Llama 3.3 70B Versatile (with JSON-schema function calling) |
 | TTS | Deepgram Aura (aura-asteria-en, MP3) |
+| Vapi | Vapi WebRTC (managed STT/LLM/TTS, tool webhook) |
 | Database | MongoDB (pymongo) |
 | Voice capture | Web Audio API → AudioWorklet → PCM-16 @ 16 kHz |
+
+---
+
+## Vapi WebRTC Architecture
+
+SmileCare supports a second transport mode using **Vapi WebRTC**. In this mode, the entire voice pipeline (STT, LLM, TTS) runs in Vapi's cloud — only tool execution hits our backend via a webhook.
+
+### Vapi Data Flow
+
+```mermaid
+graph TB
+    subgraph Browser["Browser (React)"]
+        TOGGLE["Mode Toggle<br/>WebSocket | Vapi"]
+        VAPI_SDK["@vapi-ai/web SDK"]
+        CHAT_UI["Chat Display + Debug"]
+    end
+
+    subgraph VapiCloud["Vapi Cloud"]
+        WRT["WebRTC Endpoint"]
+        V_STT["Deepgram Nova-2 STT"]
+        V_LLM["Groq Llama 3.3 70B"]
+        V_TTS["Deepgram Aura TTS"]
+    end
+
+    subgraph Backend["Our Backend (FastAPI)"]
+        WEBHOOK["POST /vapi/webhook<br/>(vapi_webhook.py)"]
+        TOOL_EXEC["Tool Handlers<br/>8 functions"]
+        MONGO["MongoDB"]
+    end
+
+    TOGGLE --> VAPI_SDK
+    VAPI_SDK <-->|"WebRTC<br/>audio + events"| WRT
+    WRT --> V_STT --> V_LLM
+    V_LLM -->|"function-call"| WEBHOOK
+    WEBHOOK --> TOOL_EXEC --> MONGO
+    MONGO --> TOOL_EXEC --> WEBHOOK
+    WEBHOOK -->|"result"| V_LLM
+    V_LLM --> V_TTS -->|"audio stream"| WRT
+    WRT --> VAPI_SDK --> CHAT_UI
+
+    style Browser fill:#e0f2fe,stroke:#0284c7
+    style VapiCloud fill:#f3e8ff,stroke:#7c3aed
+    style Backend fill:#f0fdf4,stroke:#16a34a
+```
+
+### Vapi Webhook
+
+**Endpoint:** `POST /vapi/webhook`  
+**File:** `app/routers/vapi_webhook.py`
+
+When the LLM in Vapi's cloud triggers a tool call, Vapi sends a POST request to our webhook. The webhook:
+1. Extracts `functionCall.name` and `functionCall.parameters`
+2. Dispatches to the appropriate tool handler via `_execute_tool()`
+3. Returns `{"result": "JSON string"}` to Vapi
+4. Logs execution time with `[LATENCY][VAPI]` prefix
+
+See `docs/VAPI_WEBRTC.md` for complete integration documentation.
+
+---
+
+## Latency Debug Architecture
+
+### Server-Side Pipeline Measurement
+
+The WebSocket handler in `main.py` measures latency at every stage with `[LATENCY]` log prefix:
+
+```
+[LATENCY][PIPELINE] ══════════════════════════════
+[LATENCY][PIPELINE]  STT:     342 ms  (22%)  [wav=2ms + api=340ms]
+[LATENCY][PIPELINE]  LLM:     920 ms  (60%)  [first_token=180ms, 8 chunks]
+[LATENCY][PIPELINE]  TTS:     280 ms  (18%)  [18432 bytes MP3]
+[LATENCY][PIPELINE]  TOTAL:  1542 ms  (audio captured: 2.1s)
+[LATENCY][PIPELINE] ══════════════════════════════
+```
+
+### Sub-Stage Breakdown
+
+| Stage | Sub-Stages |
+|-------|-----------|
+| **STT** | PCM→WAV conversion time + Deepgram API call time |
+| **LLM** | First token time + total time + chunk count + history size |
+| **TTS** | Generation time + MP3 byte size + text char count |
+
+### Client-Side Round-Trip Measurement
+
+The frontend independently times the journey using `performance.now()`:
+
+| Metric | Start Event | End Event |
+|--------|------------|-----------|
+| STT round-trip | `end_of_speech` sent | `final_transcript` received |
+| First LLM stream | `end_of_speech` sent | First `assistant_stream` received |
+| Full round-trip | `end_of_speech` sent | `tts_audio` received |
+| Network overhead | Computed: client round-trip − server pipeline |
+
+### Debug Panel
+
+The frontend debug panel shows both server and client metrics with color-coded thresholds, sub-stage detail rows, and running averages over the last 20 turns.
+
+### Vapi Webhook Timing
+
+Tool execution in Vapi mode is logged with `[LATENCY][VAPI]` prefix showing per-tool execution time.
+
+See `docs/LATENCY_DEBUG.md` for a comprehensive guide on interpreting all metrics.

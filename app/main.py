@@ -38,6 +38,7 @@ from app.database import (
 )
 from app.models.schema import ChatRequest
 from app.routers import clinic
+from app.routers import vapi_webhook
 from app.services.agent_service import process_message, process_message_stream
 from app.services.voice_service import (
     pcm_to_wav,
@@ -62,6 +63,7 @@ AUDIO_DIR = BASE_DIR.parent / "audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 app.include_router(clinic.router)
+app.include_router(vapi_webhook.router)
 
 
 # ── Startup event ────────────────────────────────────────────
@@ -211,15 +213,33 @@ async def websocket_voice(ws: WebSocket):
                     try:
                         # ── Stage 1: STT ─────────────────────
                         stt_start = time.time()
-                        wav = pcm_to_wav(bytes(audio_buffer), sample_rate=SAMPLE_RATE)
+
+                        # Sub-stage: PCM → WAV conversion
+                        wav_start = time.time()
+                        pcm_bytes = bytes(audio_buffer)
+                        wav = pcm_to_wav(pcm_bytes, sample_rate=SAMPLE_RATE)
+                        wav_end = time.time()
+                        wav_ms = round((wav_end - wav_start) * 1000)
+                        print(f"[LATENCY][STT] PCM→WAV: {wav_ms} ms "
+                              f"(pcm={len(pcm_bytes)} bytes, wav={len(wav)} bytes)")
+
+                        # Sub-stage: Deepgram API call
+                        api_start = time.time()
                         transcript = await transcribe_audio_bytes_async(wav)
                         transcript = (transcript or "").strip()
+                        api_end = time.time()
+                        api_ms = round((api_end - api_start) * 1000)
+
                         stt_end = time.time()
                         latency["stt_ms"] = round((stt_end - stt_start) * 1000)
-                        print(f"[ws] STT result: {transcript!r} ({latency['stt_ms']} ms)")
+                        latency["stt_wav_ms"] = wav_ms
+                        latency["stt_api_ms"] = api_ms
+                        print(f"[LATENCY][STT] Deepgram API: {api_ms} ms | "
+                              f"Total STT: {latency['stt_ms']} ms | "
+                              f"Result: {transcript!r}")
 
                         if not transcript or not _is_valid_transcript(transcript):
-                            print(f"[ws] Transcript rejected by filter")
+                            print(f"[LATENCY][STT] Transcript rejected by filter")
                             await _send({"type": "error", "message": "Could not transcribe audio"})
                             audio_buffer = bytearray()
                             continue
@@ -238,22 +258,30 @@ async def websocket_voice(ws: WebSocket):
 
                         # ── Stage 2: LLM ─────────────────────
                         llm_start = time.time()
-                        print(f"[ws] Sending to LLM: {transcript!r}")
+                        print(f"[LATENCY][LLM] Sending to Groq Llama 3.3: {transcript!r} "
+                              f"(history={len(conversation_history)} msgs)")
                         full_response = ""
                         first_chunk_time = None
+                        chunk_count = 0
                         async for chunk in process_message_stream(transcript, conversation_history):
                             if first_chunk_time is None:
                                 first_chunk_time = time.time()
+                                print(f"[LATENCY][LLM] First token: "
+                                      f"{round((first_chunk_time - llm_start) * 1000)} ms")
+                            chunk_count += 1
                             full_response += chunk
                             await _send({"type": "assistant_stream", "text": chunk})
                         llm_end = time.time()
                         latency["llm_total_ms"] = round((llm_end - llm_start) * 1000)
                         latency["llm_first_token_ms"] = round(((first_chunk_time or llm_end) - llm_start) * 1000)
-                        print(f"[ws] LLM response length: {len(full_response)} chars "
-                              f"(first_token={latency['llm_first_token_ms']} ms, total={latency['llm_total_ms']} ms)")
+                        latency["llm_chunks"] = chunk_count
+                        print(f"[LATENCY][LLM] Done — {len(full_response)} chars, "
+                              f"{chunk_count} chunks | "
+                              f"First token: {latency['llm_first_token_ms']} ms | "
+                              f"Total: {latency['llm_total_ms']} ms")
 
                         if not full_response.strip():
-                            print("[ws] WARNING: LLM returned empty response")
+                            print("[LATENCY][LLM] WARNING: empty response")
                             await _send({"type": "error", "message": "No response generated"})
                             audio_buffer = bytearray()
                             continue
@@ -262,24 +290,49 @@ async def websocket_voice(ws: WebSocket):
 
                         # ── Stage 3: TTS ─────────────────────
                         tts_start = time.time()
+                        print(f"[LATENCY][TTS] Generating Deepgram Aura audio "
+                              f"({len(full_response)} chars, "
+                              f"~{len(full_response.split())} words)")
                         try:
                             tts_bytes = await text_to_speech_bytes_async(full_response)
                             tts_end = time.time()
                             latency["tts_ms"] = round((tts_end - tts_start) * 1000)
+                            latency["tts_audio_bytes"] = len(tts_bytes)
+                            latency["tts_text_chars"] = len(full_response)
                             audio_b64 = base64.b64encode(tts_bytes).decode("ascii")
                             await _send({"type": "tts_audio", "audio": audio_b64})
-                            print(f"[ws] TTS sent — {len(tts_bytes)} bytes ({latency['tts_ms']} ms)")
+                            print(f"[LATENCY][TTS] Done — {len(tts_bytes)} bytes MP3 | "
+                                  f"{latency['tts_ms']} ms | "
+                                  f"b64 payload: {len(audio_b64)} chars")
                         except Exception as tts_exc:
                             tts_end = time.time()
                             latency["tts_ms"] = round((tts_end - tts_start) * 1000)
-                            print(f"[ws] TTS failed: {tts_exc}")
+                            print(f"[LATENCY][TTS] FAILED after {latency['tts_ms']} ms: {tts_exc}")
                             await _send({"type": "tts_error", "message": str(tts_exc)})
 
                         # ── Pipeline total ────────────────────
                         pipeline_end = time.time()
                         latency["total_ms"] = round((pipeline_end - pipeline_start) * 1000)
                         latency["audio_duration_s"] = round(buf_duration, 2)
-                        print(f"[ws] Pipeline latency: {latency}")
+
+                        # Compute percentage breakdown
+                        if latency["total_ms"] > 0:
+                            pct_stt = round(latency["stt_ms"] / latency["total_ms"] * 100)
+                            pct_llm = round(latency["llm_total_ms"] / latency["total_ms"] * 100)
+                            pct_tts = round(latency["tts_ms"] / latency["total_ms"] * 100)
+                        else:
+                            pct_stt = pct_llm = pct_tts = 0
+
+                        print(f"[LATENCY][PIPELINE] ══════════════════════════════")
+                        print(f"[LATENCY][PIPELINE]  STT:   {latency['stt_ms']:>5} ms  ({pct_stt}%)  "
+                              f"[wav={latency.get('stt_wav_ms', '?')}ms + api={latency.get('stt_api_ms', '?')}ms]")
+                        print(f"[LATENCY][PIPELINE]  LLM:   {latency['llm_total_ms']:>5} ms  ({pct_llm}%)  "
+                              f"[first_token={latency['llm_first_token_ms']}ms, {latency.get('llm_chunks', '?')} chunks]")
+                        print(f"[LATENCY][PIPELINE]  TTS:   {latency['tts_ms']:>5} ms  ({pct_tts}%)  "
+                              f"[{latency.get('tts_audio_bytes', '?')} bytes MP3]")
+                        print(f"[LATENCY][PIPELINE]  TOTAL: {latency['total_ms']:>5} ms  "
+                              f"(audio captured: {latency['audio_duration_s']}s)")
+                        print(f"[LATENCY][PIPELINE] ══════════════════════════════")
 
                         # Send latency data to frontend for debug panel
                         await _send({"type": "latency", **latency})

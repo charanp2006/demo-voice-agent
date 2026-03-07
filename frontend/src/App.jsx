@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import Vapi from '@vapi-ai/web';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 const WS_BASE  = API_BASE.replace(/^http/i, 'ws');
+const VAPI_PUBLIC_KEY = import.meta.env.VITE_VAPI_PUBLIC_KEY || '';
 
 // ── VAD tunables ────────────────────────────────────────────
 // — Noise-floor calibration
@@ -115,8 +117,16 @@ export default function App() {
   const [latencyData, setLatencyData] = useState(null);
   const latencyHistoryRef = useRef([]);  // last N latency snapshots for averaging
 
+  // Client-side round-trip timing
+  const clientTimingRef = useRef({});    // { endOfSpeechSentAt, firstTranscriptAt, firstStreamAt, ttsReceivedAt }
+
   // Info modal
   const [showInfo, setShowInfo] = useState(false);
+
+  // ── Mode toggle: 'websocket' or 'vapi' ─────────────────
+  const [mode, setMode] = useState('websocket');
+  const vapiRef = useRef(null);
+  const vapiActiveRef = useRef(false);
 
   /** Append a debug message (batched to reduce renders) */
   function dbg(msg) {
@@ -140,7 +150,7 @@ export default function App() {
   }, [messages, userText, assistantText]);
 
   // Cleanup on unmount
-  useEffect(() => () => teardown(), []);
+  useEffect(() => () => { teardown(); teardownVapi(); }, []);
 
   // ── Teardown everything ─────────────────────────────────
   function teardown() {
@@ -219,6 +229,307 @@ export default function App() {
       ttsBlobUrlRef.current = null;
     }
   }
+
+  // ── Vapi WebRTC helpers ──────────────────────────────────
+
+  function teardownVapi() {
+    if (vapiRef.current) {
+      try { vapiRef.current.stop(); } catch (_) {}
+      vapiRef.current.removeAllListeners?.();
+      vapiRef.current = null;
+    }
+    vapiActiveRef.current = false;
+    setIsTTSPlaying(false);
+    setIsProcessing(false);
+    setIsSpeaking(false);
+  }
+
+  const startVapiConversation = useCallback(async () => {
+    teardownVapi();
+    teardown();
+
+    setConversationActive(true);
+    vapiActiveRef.current = true;
+    setMessages([]);
+    setUserText('');
+    setAssistantText('');
+    setStatus('Connecting to Vapi…');
+    assistantBuf.current = '';
+
+    if (!VAPI_PUBLIC_KEY) {
+      setStatus('Error: VITE_VAPI_PUBLIC_KEY not set');
+      dbg('ERROR: VITE_VAPI_PUBLIC_KEY env var is missing');
+      setConversationActive(false);
+      return;
+    }
+
+    const vapi = new Vapi(VAPI_PUBLIC_KEY);
+    vapiRef.current = vapi;
+
+    // ── Vapi event handlers ───────────────────────────────
+    vapi.on('call-start', () => {
+      dbg('Vapi call started (WebRTC connected)');
+      setStatus('Listening… speak naturally.');
+    });
+
+    vapi.on('call-end', () => {
+      dbg('Vapi call ended');
+      vapiActiveRef.current = false;
+      setConversationActive(false);
+      setIsSpeaking(false);
+      setIsProcessing(false);
+      setIsTTSPlaying(false);
+      setStatus('Conversation ended.');
+    });
+
+    vapi.on('speech-start', () => {
+      dbg('Vapi: user speech started');
+      setIsSpeaking(true);
+      setStatus('Listening…');
+      // Barge-in: clear assistant text if TTS was playing
+      if (assistantBuf.current) {
+        const partial = assistantBuf.current.trim();
+        if (partial) setMessages(prev => [...prev, { role: 'assistant', content: partial }]);
+        setAssistantText('');
+        assistantBuf.current = '';
+      }
+      setIsTTSPlaying(false);
+    });
+
+    vapi.on('speech-end', () => {
+      dbg('Vapi: user speech ended');
+      setIsSpeaking(false);
+      setIsProcessing(true);
+      setStatus('Processing your speech…');
+    });
+
+    vapi.on('volume-level', (level) => {
+      setRmsLevel(level);
+    });
+
+    vapi.on('message', (msg) => {
+      switch (msg.type) {
+        case 'transcript': {
+          if (msg.role === 'user') {
+            if (msg.transcriptType === 'partial') {
+              setUserText(msg.transcript);
+              dbg(`Vapi partial transcript: "${msg.transcript}"`);
+            } else {
+              // final
+              setUserText('');
+              if (msg.transcript?.trim()) {
+                setMessages(prev => [...prev, { role: 'user', content: msg.transcript.trim() }]);
+                dbg(`Vapi final transcript: "${msg.transcript}"`);
+              }
+            }
+          } else if (msg.role === 'assistant') {
+            if (msg.transcriptType === 'partial') {
+              assistantBuf.current = msg.transcript;
+              setAssistantText(msg.transcript);
+              setIsTTSPlaying(true);
+              setIsProcessing(false);
+              setStatus('Assistant is speaking…');
+            } else {
+              // final assistant transcript
+              const fullText = msg.transcript?.trim();
+              if (fullText) {
+                setMessages(prev => [...prev, { role: 'assistant', content: fullText }]);
+                dbg(`Vapi assistant done: "${fullText.slice(0, 80)}…"`);
+              }
+              setAssistantText('');
+              assistantBuf.current = '';
+              setIsTTSPlaying(false);
+              setIsProcessing(false);
+              setStatus('Listening… speak naturally.');
+            }
+          }
+          break;
+        }
+        case 'function-call':
+          dbg(`Vapi tool call: ${msg.functionCall?.name}(${JSON.stringify(msg.functionCall?.parameters || {})})`);
+          break;
+        case 'end-of-call-report': {
+          const r = msg;
+          dbg(`Vapi call report — duration: ${r.durationSeconds}s, cost: $${r.cost?.toFixed(4)}`);
+          if (r.analysis) dbg(`Vapi analysis: ${JSON.stringify(r.analysis).slice(0, 200)}`);
+          break;
+        }
+        default:
+          break;
+      }
+    });
+
+    vapi.on('error', (err) => {
+      dbg(`Vapi ERROR: ${err.message || JSON.stringify(err)}`);
+      setStatus(`Vapi error: ${err.message || 'Unknown'}`);
+      setTimeout(() => {
+        if (vapiActiveRef.current) setStatus('Listening… speak naturally.');
+      }, 3000);
+    });
+
+    // ── Start the Vapi call with inline assistant config ───
+    try {
+      // Build server URL from current API_BASE for tool execution
+      const serverUrl = `${API_BASE}/vapi/webhook`;
+      dbg(`Vapi serverUrl: ${serverUrl}`);
+
+      await vapi.start({
+        transcriber: {
+          provider: 'deepgram',
+          model: 'nova-2',
+          language: 'en',
+        },
+        model: {
+          provider: 'groq',
+          model: 'llama-3.3-70b-versatile',
+          temperature: 0.7,
+          messages: [
+            {
+              role: 'system',
+              content: [
+                'You are SmileCare AI – a friendly, professional dental clinic receptionist.',
+                `Today's date is ${new Date().toISOString().split('T')[0]} (${new Date().toLocaleDateString('en-US', { weekday: 'long' })}).`,
+                '',
+                'SCOPE: You ONLY handle dental clinic topics: appointments, services, dentist info, clinic hours, dental health advice.',
+                'If asked about anything unrelated, politely decline and say you can only help with dental care.',
+                '',
+                'TOOL CALLING: When the user needs an action (booking, cancelling, checking slots, etc.), call the appropriate tool.',
+                'Confirm details before booking or cancelling. If fields are missing, ask the user.',
+                'After tool results, present them in a friendly, human way. Never show raw JSON.',
+                '',
+                'STYLE: Be warm and concise. Use short sentences suitable for voice. Keep responses under 3-4 sentences.',
+              ].join('\n'),
+            },
+          ],
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'check_available_slots',
+                description: 'Check available appointment time slots for a given date.',
+                parameters: { type: 'object', properties: { date: { type: 'string', description: 'Date in YYYY-MM-DD format.' } }, required: ['date'] },
+              },
+              server: { url: serverUrl },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'book_appointment',
+                description: 'Book a dental appointment for a patient.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    patient_name: { type: 'string', description: 'Full name of the patient.' },
+                    patient_phone: { type: 'string', description: 'Phone number of the patient.' },
+                    date: { type: 'string', description: 'Appointment date YYYY-MM-DD.' },
+                    time: { type: 'string', description: "Appointment time, e.g. '10:00 AM'." },
+                    service: { type: 'string', description: 'Dental service requested (optional).' },
+                  },
+                  required: ['patient_name', 'patient_phone', 'date', 'time'],
+                },
+              },
+              server: { url: serverUrl },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'cancel_appointment',
+                description: 'Cancel an existing dental appointment by date and time.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    date: { type: 'string', description: 'Appointment date YYYY-MM-DD.' },
+                    time: { type: 'string', description: "Appointment time, e.g. '10:00 AM'." },
+                    patient_phone: { type: 'string', description: 'Patient phone for verification.' },
+                  },
+                  required: ['date', 'time'],
+                },
+              },
+              server: { url: serverUrl },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'reschedule_appointment',
+                description: 'Reschedule an existing appointment to a new date/time.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    old_date: { type: 'string', description: 'Current appointment date YYYY-MM-DD.' },
+                    old_time: { type: 'string', description: 'Current appointment time.' },
+                    new_date: { type: 'string', description: 'New appointment date YYYY-MM-DD.' },
+                    new_time: { type: 'string', description: 'New appointment time.' },
+                    patient_phone: { type: 'string', description: 'Patient phone for verification.' },
+                  },
+                  required: ['old_date', 'old_time', 'new_date', 'new_time'],
+                },
+              },
+              server: { url: serverUrl },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'get_dental_services',
+                description: 'Retrieve dental services with prices, categories, and durations.',
+                parameters: { type: 'object', properties: { category: { type: 'string', description: 'Optional category filter.' } } },
+              },
+              server: { url: serverUrl },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'get_clinic_info',
+                description: 'Get clinic info: name, hours, location, and contact details.',
+                parameters: { type: 'object', properties: {} },
+              },
+              server: { url: serverUrl },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'get_patient_appointments',
+                description: "Look up a patient's appointments by phone number.",
+                parameters: { type: 'object', properties: { patient_phone: { type: 'string', description: "Patient's phone number." } }, required: ['patient_phone'] },
+              },
+              server: { url: serverUrl },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'get_dentists',
+                description: 'Get information about dentists at the clinic.',
+                parameters: { type: 'object', properties: { specialization: { type: 'string', description: 'Optional specialization filter.' } } },
+              },
+              server: { url: serverUrl },
+            },
+          ],
+        },
+        voice: {
+          provider: 'deepgram',
+          voiceId: 'asteria',
+        },
+        name: 'SmileCare AI',
+        firstMessage: 'Hello! Welcome to SmileCare Dental Clinic. How can I help you today?',
+      });
+
+      dbg('Vapi call starting…');
+    } catch (err) {
+      dbg(`Vapi start failed: ${err.message}`);
+      setStatus(`Failed to start Vapi: ${err.message}`);
+      setConversationActive(false);
+      vapiActiveRef.current = false;
+    }
+  }, []);
+
+  const stopVapiConversation = useCallback(() => {
+    teardownVapi();
+    setConversationActive(false);
+    setIsSpeaking(false);
+    setIsProcessing(false);
+    setUserText('');
+    setAssistantText('');
+    setStatus('Conversation ended.');
+  }, []);
 
   // ── Start Conversation ──────────────────────────────────
   const startConversation = useCallback(async () => {
@@ -393,6 +704,12 @@ export default function App() {
                   setStatus('Processing your speech…');
                   if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: 'end_of_speech' }));
+                    clientTimingRef.current = {
+                      endOfSpeechSentAt: performance.now(),
+                      firstTranscriptAt: null,
+                      firstStreamAt: null,
+                      ttsReceivedAt: null,
+                    };
                   }
                 } else {
                   dbg(`Discarded short speech (duration=${dur} ms < ${VAD_SPEECH_MIN_MS})`);
@@ -439,6 +756,13 @@ export default function App() {
           const wordCount = text.split(/\s+/).filter(Boolean).length;
           dbg(`Final transcript: "${text}" (${wordCount} words, ${text.length} chars)`);
 
+          // Client-side timing: end_of_speech → final_transcript
+          if (clientTimingRef.current.endOfSpeechSentAt && !clientTimingRef.current.firstTranscriptAt) {
+            clientTimingRef.current.firstTranscriptAt = performance.now();
+            const rt = Math.round(clientTimingRef.current.firstTranscriptAt - clientTimingRef.current.endOfSpeechSentAt);
+            dbg(`⏱ CLIENT: end_of_speech → final_transcript: ${rt} ms (includes STT + network)`);
+          }
+
           // Reject short transcripts
           if (text.length < MIN_TRANSCRIPT_CHARS || wordCount < MIN_TRANSCRIPT_WORDS) {
             dbg(`REJECTED short transcript`);
@@ -476,6 +800,12 @@ export default function App() {
 
         case 'assistant_stream':
           assistantBuf.current += (data.text || '');
+          // Client-side timing: end_of_speech → first assistant_stream
+          if (clientTimingRef.current.endOfSpeechSentAt && !clientTimingRef.current.firstStreamAt) {
+            clientTimingRef.current.firstStreamAt = performance.now();
+            const rt = Math.round(clientTimingRef.current.firstStreamAt - clientTimingRef.current.endOfSpeechSentAt);
+            dbg(`⏱ CLIENT: end_of_speech → first assistant_stream: ${rt} ms (STT + LLM first token + network)`);
+          }
           // Don't show streaming text — it will be revealed word-by-word during TTS
           break;
 
@@ -505,6 +835,13 @@ export default function App() {
           }
 
           dbg(`TTS audio received (${data.audio.length} b64 chars)`);
+
+          // Client-side timing: end_of_speech → tts_audio
+          if (clientTimingRef.current.endOfSpeechSentAt && !clientTimingRef.current.ttsReceivedAt) {
+            clientTimingRef.current.ttsReceivedAt = performance.now();
+            const total = Math.round(clientTimingRef.current.ttsReceivedAt - clientTimingRef.current.endOfSpeechSentAt);
+            dbg(`⏱ CLIENT: end_of_speech → tts_audio: ${total} ms (full round-trip)`);
+          }
 
           // Decode base64 → Blob → Object URL
           const raw = atob(data.audio);
@@ -616,10 +953,23 @@ export default function App() {
 
         case 'latency': {
           const l = data;
+          // Merge client-side timing into latency data
+          const ct = clientTimingRef.current;
+          if (ct.endOfSpeechSentAt) {
+            if (ct.firstTranscriptAt) l.client_stt_rt_ms = Math.round(ct.firstTranscriptAt - ct.endOfSpeechSentAt);
+            if (ct.firstStreamAt) l.client_first_stream_ms = Math.round(ct.firstStreamAt - ct.endOfSpeechSentAt);
+            if (ct.ttsReceivedAt) l.client_total_rt_ms = Math.round(ct.ttsReceivedAt - ct.endOfSpeechSentAt);
+          }
           setLatencyData(l);
           latencyHistoryRef.current.push(l);
           if (latencyHistoryRef.current.length > 20) latencyHistoryRef.current.shift();
-          dbg(`⏱ LATENCY — STT: ${l.stt_ms}ms | LLM first-token: ${l.llm_first_token_ms}ms | LLM total: ${l.llm_total_ms}ms | TTS: ${l.tts_ms}ms | Pipeline: ${l.total_ms}ms | Audio: ${l.audio_duration_s}s`);
+          dbg(`⏱ LATENCY — STT: ${l.stt_ms}ms [wav=${l.stt_wav_ms || '?'}ms + api=${l.stt_api_ms || '?'}ms] | ` +
+              `LLM: first=${l.llm_first_token_ms}ms total=${l.llm_total_ms}ms (${l.llm_chunks || '?'} chunks) | ` +
+              `TTS: ${l.tts_ms}ms (${l.tts_audio_bytes || '?'} bytes) | ` +
+              `Pipeline: ${l.total_ms}ms | Audio: ${l.audio_duration_s}s`);
+          if (l.client_total_rt_ms) {
+            dbg(`⏱ CLIENT round-trip: ${l.client_total_rt_ms}ms (overhead vs server: ${l.client_total_rt_ms - l.total_ms}ms)`);
+          }
           break;
         }
 
@@ -679,21 +1029,41 @@ export default function App() {
           <p className="mt-0.5 text-xs text-slate-500">{status}</p>
         </div>
 
-        {conversationActive ? (
-          <button
-            onClick={stopConversation}
-            className="rounded-full bg-red-600 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-red-200 transition hover:bg-red-700 active:scale-95"
-          >
-            Stop Conversation
-          </button>
-        ) : (
-          <button
-            onClick={startConversation}
-            className="rounded-full bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-200 transition hover:bg-emerald-700 active:scale-95"
-          >
-            Start Conversation
-          </button>
-        )}
+        <div className="flex items-center gap-3">
+          {/* Mode toggle */}
+          {!conversationActive && (
+            <div className="flex items-center gap-1.5 rounded-full bg-slate-100 p-1 text-xs font-medium">
+              <button
+                onClick={() => setMode('websocket')}
+                className={`rounded-full px-3 py-1.5 transition ${mode === 'websocket' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+              >
+                WebSocket
+              </button>
+              <button
+                onClick={() => setMode('vapi')}
+                className={`rounded-full px-3 py-1.5 transition ${mode === 'vapi' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+              >
+                Vapi WebRTC
+              </button>
+            </div>
+          )}
+
+          {conversationActive ? (
+            <button
+              onClick={mode === 'vapi' ? stopVapiConversation : stopConversation}
+              className="rounded-full bg-red-600 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-red-200 transition hover:bg-red-700 active:scale-95"
+            >
+              Stop Conversation
+            </button>
+          ) : (
+            <button
+              onClick={mode === 'vapi' ? startVapiConversation : startConversation}
+              className="rounded-full bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-200 transition hover:bg-emerald-700 active:scale-95"
+            >
+              Start Conversation
+            </button>
+          )}
+        </div>
       </header>
 
       {/* ── Chat area ──────────────────────────────────── */}
@@ -792,6 +1162,9 @@ export default function App() {
           <p className="text-xs text-slate-500">
             {isCalibrating ? 'Calibrating…' : isTTSPlaying ? 'Speaking…' : isSpeaking ? 'Listening…' : isProcessing ? 'Processing…' : 'Waiting for speech'}
           </p>
+          <span className={`mt-0.5 inline-block rounded-full px-2 py-0.5 text-[10px] font-medium ${mode === 'vapi' ? 'bg-violet-100 text-violet-700' : 'bg-slate-100 text-slate-600'}`}>
+            {mode === 'vapi' ? '⚡ Vapi WebRTC' : '🔌 WebSocket'}
+          </span>
         </footer>
       )}
 
@@ -814,6 +1187,14 @@ export default function App() {
                   <span className={latencyData.stt_ms < 800 ? 'text-emerald-400' : latencyData.stt_ms < 1500 ? 'text-yellow-400' : 'text-red-400'}>
                     {latencyData.stt_ms} ms
                   </span>
+                  {latencyData.stt_wav_ms != null && (
+                    <>
+                      <span className="text-slate-500 pl-2">└ PCM→WAV:</span>
+                      <span className="text-slate-400">{latencyData.stt_wav_ms} ms</span>
+                      <span className="text-slate-500 pl-2">└ API call:</span>
+                      <span className="text-slate-400">{latencyData.stt_api_ms} ms</span>
+                    </>
+                  )}
                   <span className="text-slate-400">LLM first token:</span>
                   <span className={latencyData.llm_first_token_ms < 500 ? 'text-emerald-400' : latencyData.llm_first_token_ms < 1000 ? 'text-yellow-400' : 'text-red-400'}>
                     {latencyData.llm_first_token_ms} ms
@@ -822,10 +1203,22 @@ export default function App() {
                   <span className={latencyData.llm_total_ms < 2000 ? 'text-emerald-400' : latencyData.llm_total_ms < 4000 ? 'text-yellow-400' : 'text-red-400'}>
                     {latencyData.llm_total_ms} ms
                   </span>
+                  {latencyData.llm_chunks != null && (
+                    <>
+                      <span className="text-slate-500 pl-2">└ Chunks:</span>
+                      <span className="text-slate-400">{latencyData.llm_chunks}</span>
+                    </>
+                  )}
                   <span className="text-slate-400">TTS (Deepgram Aura):</span>
                   <span className={latencyData.tts_ms < 800 ? 'text-emerald-400' : latencyData.tts_ms < 1500 ? 'text-yellow-400' : 'text-red-400'}>
                     {latencyData.tts_ms} ms
                   </span>
+                  {latencyData.tts_audio_bytes != null && (
+                    <>
+                      <span className="text-slate-500 pl-2">└ Audio size:</span>
+                      <span className="text-slate-400">{(latencyData.tts_audio_bytes / 1024).toFixed(1)} KB</span>
+                    </>
+                  )}
                   <span className="text-slate-400 font-bold">Total pipeline:</span>
                   <span className={`font-bold ${latencyData.total_ms < 2000 ? 'text-emerald-400' : latencyData.total_ms < 4000 ? 'text-yellow-400' : 'text-red-400'}`}>
                     {latencyData.total_ms} ms
@@ -833,6 +1226,30 @@ export default function App() {
                   <span className="text-slate-400">Audio captured:</span>
                   <span className="text-slate-300">{latencyData.audio_duration_s}s</span>
                 </div>
+                {/* Client-side round-trip metrics */}
+                {latencyData.client_total_rt_ms != null && (
+                  <div className="mt-1.5 pt-1.5 border-t border-slate-700">
+                    <p className="text-[10px] font-mono text-violet-400 font-bold mb-0.5">📡 Client Round-Trip</p>
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px] font-mono">
+                      {latencyData.client_stt_rt_ms != null && (
+                        <>
+                          <span className="text-slate-400">→ final_transcript:</span>
+                          <span className="text-violet-300">{latencyData.client_stt_rt_ms} ms</span>
+                        </>
+                      )}
+                      {latencyData.client_first_stream_ms != null && (
+                        <>
+                          <span className="text-slate-400">→ first LLM chunk:</span>
+                          <span className="text-violet-300">{latencyData.client_first_stream_ms} ms</span>
+                        </>
+                      )}
+                      <span className="text-slate-400">→ TTS audio:</span>
+                      <span className="text-violet-300">{latencyData.client_total_rt_ms} ms</span>
+                      <span className="text-slate-500">Network overhead:</span>
+                      <span className="text-slate-400">{latencyData.client_total_rt_ms - latencyData.total_ms} ms</span>
+                    </div>
+                  </div>
+                )}
                 {latencyHistoryRef.current.length > 1 && (
                   <p className="text-[9px] text-slate-500 mt-1">
                     Avg over {latencyHistoryRef.current.length} turns: {Math.round(latencyHistoryRef.current.reduce((s, d) => s + d.total_ms, 0) / latencyHistoryRef.current.length)} ms
@@ -991,7 +1408,7 @@ export default function App() {
                     <div><span className="font-medium">TTS:</span> Deepgram Aura</div>
                     <div><span className="font-medium">Backend:</span> FastAPI</div>
                     <div><span className="font-medium">Frontend:</span> React + Vite</div>
-                    <div><span className="font-medium">Transport:</span> WebSocket</div>
+                    <div><span className="font-medium">Transport:</span> {mode === 'vapi' ? 'Vapi WebRTC' : 'WebSocket'}</div>
                   </div>
                 </div>
               </section>
