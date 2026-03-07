@@ -44,9 +44,11 @@ graph LR
   SRV -->|"JSON messages"| UI
 ```
 
-### Two-button Interface
+### Two-button Interface + Info Button
 
-The UI has only **two controls**: **Start Conversation** and **Stop Conversation**. There is no separate mic toggle, no text input, and no debug panel. Speech boundaries are detected automatically by the VAD.
+The UI has only **two controls**: **Start Conversation** and **Stop Conversation**. There is no separate mic toggle and no text input. Speech boundaries are detected automatically by the VAD.
+
+A **floating info button** (blue circle, bottom-right) opens a modal with clinic details, services, departments, dentists, and the AI assistant’s capabilities.
 
 ---
 
@@ -185,6 +187,7 @@ sequenceDiagram
 | `assistant_done` | Store full text, wait for TTS audio |
 | `tts_audio` | Play MP3 + reveal words one-by-one, 🔊 icon in bubble |
 | `tts_error` | Show full text immediately without audio |
+| `latency` | Update latency dashboard in debug panel (color-coded per-stage metrics) |
 | `error` | Flash error status for 3 s, then resume |
 
 ---
@@ -216,7 +219,17 @@ The entire frontend is a single `App.jsx` component with these visual sections:
 - Collapsible panel at bottom-right (▲ Show Debug / ▼ Hide Debug)
 - Timestamped, color-coded log entries (red for errors, green for confirmations)
 - Shows VAD events, transcript decisions, TTS events
+- **Latency Dashboard**: color-coded per-stage metrics (green ≤300ms, yellow ≤800ms, red >800ms) with running averages
 - Also logs to browser console with `[VAD-DBG]` prefix
+
+### Floating Info Button
+- Fixed blue circle at bottom-right (z-index 40)
+- Opens a scrollable modal with 5 sections:
+  - **Clinic Info**: SmileCare contact details and opening hours
+  - **Hospital Services**: 15 dental services with prices
+  - **Departments & Dentists**: 3 specialists with availability
+  - **AI Assistant Capabilities**: 7 features the bot can handle
+  - **Technology Stack**: current STT/LLM/TTS pipeline info
 
 ---
 
@@ -239,6 +252,8 @@ All state is managed with React hooks (`useState`, `useRef`, `useCallback`):
 | `isCalibrating` | `boolean` | Noise-floor calibration in progress |
 | `debugLogs` | `string[]` | Debug panel log entries |
 | `showDebug` | `boolean` | Debug panel visibility |
+| `latencyData` | `object\|null` | Latest pipeline latency metrics (stt_ms, llm_first_token_ms, etc.) |
+| `showInfo` | `boolean` | Info modal visibility |
 
 ### Refs
 
@@ -266,6 +281,7 @@ All state is managed with React hooks (`useState`, `useRef`, `useCallback`):
 | `ttsTextRef` | Full assistant text during TTS |
 | `wordTimerRef` | setInterval ID for word reveal |
 | `ttsBlobUrlRef` | Object URL for TTS audio blob |
+| `latencyHistoryRef` | Array of past latency measurements for running averages |
 
 ---
 

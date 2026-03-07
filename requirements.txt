@@ -9,14 +9,18 @@ python-multipart>=0.0.6
 pymongo>=4.6.0
 
 # ── AI / LLM ────────────────────────────────
-google-genai>=1.0.0
-
-# ── Speech-to-Text ──────────────────────────
 groq>=0.4.0
+# google-genai>=1.0.0          # Uncomment to use Gemini backend
 
-# ── Text-to-Speech ──────────────────────────
-elevenlabs>=1.0.0
-gTTS>=2.5.0
+# ── HTTP client (Deepgram API calls) ────────
+httpx>=0.27.0
+
+# ── Speech-to-Text (Deepgram Nova-3 via httpx — no extra package needed)
+# ── Text-to-Speech (Deepgram Aura via httpx — no extra package needed)
+
+# ── Backup STT/TTS (uncomment to use) ───────
+# elevenlabs>=1.0.0
+# gTTS>=2.5.0
 
 # ── WebSocket ────────────────────────────────
 websockets>=12.0

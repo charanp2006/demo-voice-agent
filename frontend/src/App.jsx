@@ -111,6 +111,13 @@ export default function App() {
   const debugFlushTimer = useRef(null);
   const [showDebug, setShowDebug] = useState(false);
 
+  // Pipeline latency metrics from backend
+  const [latencyData, setLatencyData] = useState(null);
+  const latencyHistoryRef = useRef([]);  // last N latency snapshots for averaging
+
+  // Info modal
+  const [showInfo, setShowInfo] = useState(false);
+
   /** Append a debug message (batched to reduce renders) */
   function dbg(msg) {
     const entry = `[${new Date().toLocaleTimeString('en-GB', { hour12: false })}] ${msg}`;
@@ -607,6 +614,15 @@ export default function App() {
           break;
         }
 
+        case 'latency': {
+          const l = data;
+          setLatencyData(l);
+          latencyHistoryRef.current.push(l);
+          if (latencyHistoryRef.current.length > 20) latencyHistoryRef.current.shift();
+          dbg(`⏱ LATENCY — STT: ${l.stt_ms}ms | LLM first-token: ${l.llm_first_token_ms}ms | LLM total: ${l.llm_total_ms}ms | TTS: ${l.tts_ms}ms | Pipeline: ${l.total_ms}ms | Audio: ${l.audio_duration_s}s`);
+          break;
+        }
+
         case 'error':
           dbg(`SERVER ERROR: ${data.message}`);
           setIsProcessing(false);
@@ -788,24 +804,207 @@ export default function App() {
           {showDebug ? '▼ Hide Debug' : '▲ Show Debug'}
         </button>
         {showDebug && (
-          <div className="h-64 overflow-y-auto bg-slate-900 p-2 text-[10px] leading-relaxed font-mono text-green-400 border-t border-slate-700">
-            {debugLogs.length === 0 && (
-              <p className="text-slate-500">No debug events yet. Start a conversation.</p>
-            )}
-            {debugLogs.map((line, i) => (
-              <div key={i} className={
-                line.includes('ERROR') || line.includes('REJECTED') || line.includes('WARNING')
-                  ? 'text-red-400'
-                  : line.includes('CONFIRMED') || line.includes('done')
-                    ? 'text-emerald-400'
-                    : ''
-              }>
-                {line}
+          <div className="bg-slate-900 border-t border-slate-700">
+            {/* ── Latency dashboard ─────────────────────── */}
+            {latencyData && (
+              <div className="p-2 border-b border-slate-700">
+                <p className="text-[10px] font-mono text-cyan-400 font-bold mb-1">⏱ Pipeline Latency (last turn)</p>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px] font-mono">
+                  <span className="text-slate-400">STT (Deepgram Nova-3):</span>
+                  <span className={latencyData.stt_ms < 800 ? 'text-emerald-400' : latencyData.stt_ms < 1500 ? 'text-yellow-400' : 'text-red-400'}>
+                    {latencyData.stt_ms} ms
+                  </span>
+                  <span className="text-slate-400">LLM first token:</span>
+                  <span className={latencyData.llm_first_token_ms < 500 ? 'text-emerald-400' : latencyData.llm_first_token_ms < 1000 ? 'text-yellow-400' : 'text-red-400'}>
+                    {latencyData.llm_first_token_ms} ms
+                  </span>
+                  <span className="text-slate-400">LLM total:</span>
+                  <span className={latencyData.llm_total_ms < 2000 ? 'text-emerald-400' : latencyData.llm_total_ms < 4000 ? 'text-yellow-400' : 'text-red-400'}>
+                    {latencyData.llm_total_ms} ms
+                  </span>
+                  <span className="text-slate-400">TTS (Deepgram Aura):</span>
+                  <span className={latencyData.tts_ms < 800 ? 'text-emerald-400' : latencyData.tts_ms < 1500 ? 'text-yellow-400' : 'text-red-400'}>
+                    {latencyData.tts_ms} ms
+                  </span>
+                  <span className="text-slate-400 font-bold">Total pipeline:</span>
+                  <span className={`font-bold ${latencyData.total_ms < 2000 ? 'text-emerald-400' : latencyData.total_ms < 4000 ? 'text-yellow-400' : 'text-red-400'}`}>
+                    {latencyData.total_ms} ms
+                  </span>
+                  <span className="text-slate-400">Audio captured:</span>
+                  <span className="text-slate-300">{latencyData.audio_duration_s}s</span>
+                </div>
+                {latencyHistoryRef.current.length > 1 && (
+                  <p className="text-[9px] text-slate-500 mt-1">
+                    Avg over {latencyHistoryRef.current.length} turns: {Math.round(latencyHistoryRef.current.reduce((s, d) => s + d.total_ms, 0) / latencyHistoryRef.current.length)} ms
+                  </p>
+                )}
               </div>
-            ))}
+            )}
+            {/* ── Log entries ───────────────────────────── */}
+            <div className="h-48 overflow-y-auto p-2 text-[10px] leading-relaxed font-mono text-green-400">
+              {debugLogs.length === 0 && (
+                <p className="text-slate-500">No debug events yet. Start a conversation.</p>
+              )}
+              {debugLogs.map((line, i) => (
+                <div key={i} className={
+                  line.includes('ERROR') || line.includes('REJECTED') || line.includes('WARNING')
+                    ? 'text-red-400'
+                    : line.includes('CONFIRMED') || line.includes('done')
+                      ? 'text-emerald-400'
+                      : line.includes('LATENCY')
+                        ? 'text-cyan-400'
+                        : ''
+                }>
+                  {line}
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </div>
+
+      {/* ── Floating Info Button ────────────────────────── */}
+      <button
+        onClick={() => setShowInfo(true)}
+        className="fixed bottom-16 right-5 z-40 flex h-12 w-12 items-center justify-center rounded-full bg-blue-600 text-white shadow-lg shadow-blue-200 transition hover:bg-blue-700 hover:scale-105 active:scale-95"
+        title="Clinic Information"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-6 w-6">
+          <circle cx="12" cy="12" r="10" />
+          <path d="M12 16v-4" />
+          <path d="M12 8h.01" />
+        </svg>
+      </button>
+
+      {/* ── Info Modal ─────────────────────────────────── */}
+      {showInfo && (
+        <div className="fixed inset-0 z-100 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setShowInfo(false)}>
+          <div
+            className="relative w-full max-w-lg max-h-[85vh] overflow-y-auto rounded-2xl bg-white shadow-2xl"
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Modal header */}
+            <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4 rounded-t-2xl">
+              <h2 className="text-lg font-bold text-slate-900">🦷 SmileCare Dental Clinic</h2>
+              <button
+                onClick={() => setShowInfo(false)}
+                className="rounded-full p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Modal body */}
+            <div className="px-6 py-5 space-y-5">
+
+              {/* Clinic Info */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-blue-100 text-blue-600 text-xs">🏥</span>
+                  Clinic Information
+                </h3>
+                <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600 space-y-1.5">
+                  <p><span className="font-medium text-slate-700">Name:</span> SmileCare Dental Clinic</p>
+                  <p><span className="font-medium text-slate-700">Address:</span> 123 Dental Avenue, Suite 200, Mysore, KA 570001</p>
+                  <p><span className="font-medium text-slate-700">Hours:</span> Mon–Fri 9:00 AM – 5:00 PM, Sat 9:00 AM – 3:00 PM</p>
+                  <p><span className="font-medium text-slate-700">Phone:</span> +1-555-0100</p>
+                  <p><span className="font-medium text-slate-700">Email:</span> hello@smilecare.com</p>
+                  <p><span className="font-medium text-slate-700">Emergency:</span> +1-555-0199 (24/7)</p>
+                </div>
+              </section>
+
+              {/* Hospital Services */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-100 text-emerald-600 text-xs">🩺</span>
+                  Hospital Services
+                </h3>
+                <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600">
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      'General Checkup', 'Teeth Cleaning', 'Dental X-Ray', 'Tooth Filling',
+                      'Root Canal', 'Tooth Extraction', 'Teeth Whitening', 'Dental Crown',
+                      'Dental Bridge', 'Braces & Orthodontics', 'Dental Implant', 'Gum Treatment',
+                      'Porcelain Veneer', 'Wisdom Tooth Removal', 'Emergency Services',
+                    ].map(s => (
+                      <div key={s} className="flex items-center gap-1.5">
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 flex shrink-0" />
+                        <span>{s}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </section>
+
+              {/* Departments / Dentists */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-violet-100 text-violet-600 text-xs">👨‍⚕️</span>
+                  Departments & Dentists
+                </h3>
+                <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600 space-y-2">
+                  <div className="flex justify-between"><span className="font-medium">Dr. Sarah Johnson</span><span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">General Dentistry</span></div>
+                  <div className="flex justify-between"><span className="font-medium">Dr. Michael Chen</span><span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full">Orthodontics</span></div>
+                  <div className="flex justify-between"><span className="font-medium">Dr. Emily Rodriguez</span><span className="text-xs bg-rose-100 text-rose-700 px-2 py-0.5 rounded-full">Endodontics</span></div>
+                </div>
+              </section>
+
+              {/* AI Assistant Capabilities */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-amber-100 text-amber-600 text-xs">🤖</span>
+                  AI Assistant Capabilities
+                </h3>
+                <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600">
+                  <div className="grid grid-cols-1 gap-2">
+                    {[
+                      ['📅', 'Book, cancel, or reschedule appointments by voice'],
+                      ['🔍', 'Check available time slots for any date'],
+                      ['💰', 'Get service details, durations, and pricing'],
+                      ['👨‍⚕️', 'Find dentists by specialization'],
+                      ['📋', 'Look up your appointment history'],
+                      ['ℹ️', 'Answer clinic FAQs (hours, location, contact)'],
+                      ['🦷', 'Provide general dental health advice'],
+                    ].map(([icon, text]) => (
+                      <div key={text} className="flex items-start gap-2">
+                        <span className="flex shrink-0">{icon}</span>
+                        <span>{text}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </section>
+
+              {/* Tech Stack */}
+              <section>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700 mb-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-200 text-slate-600 text-xs">⚡</span>
+                  Technology Stack
+                </h3>
+                <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div><span className="font-medium">STT:</span> Deepgram Nova-3</div>
+                    <div><span className="font-medium">LLM:</span> Groq Llama 3</div>
+                    <div><span className="font-medium">TTS:</span> Deepgram Aura</div>
+                    <div><span className="font-medium">Backend:</span> FastAPI</div>
+                    <div><span className="font-medium">Frontend:</span> React + Vite</div>
+                    <div><span className="font-medium">Transport:</span> WebSocket</div>
+                  </div>
+                </div>
+              </section>
+
+            </div>
+
+            {/* Modal footer */}
+            <div className="sticky bottom-0 border-t border-slate-200 bg-slate-50 px-6 py-3 text-center rounded-b-2xl">
+              <p className="text-xs text-slate-400">Say "Start Conversation" to talk with SmileCare AI</p>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

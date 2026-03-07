@@ -18,11 +18,11 @@ graph TB
     subgraph Backend["Backend (FastAPI)"]
         WSH["WebSocket Handler<br/>(main.py)"]
         BUF["Audio Buffer<br/>(bytearray)"]
-        STT["Groq Whisper<br/>Speech-to-Text"]
+        STT["Deepgram Nova-3<br/>Speech-to-Text"]
         FILTER["Transcript Filter<br/>Hallucination Blocklist"]
         AGT["Agent Service<br/>Dental Validation"]
-        LLM["Gemini 2.5 Flash<br/>+ Function Calling"]
-        TTS_GEN["TTS Generation<br/>ElevenLabs / gTTS"]
+        LLM["Groq Llama 3.3 70B<br/>+ Function Calling"]
+        TTS_GEN["TTS Generation<br/>Deepgram Aura"]
         TOOLS["Tool Handlers<br/>check_slots · book · cancel<br/>reschedule · services · info<br/>dentists · patient_appts"]
     end
 
@@ -67,8 +67,8 @@ sequenceDiagram
     participant FE as Frontend<br/>(React + AudioWorklet)
     participant WS as WebSocket
     participant BE as Backend<br/>(FastAPI)
-    participant STT as Groq Whisper
-    participant LLM as Gemini LLM
+    participant STT as Deepgram Nova-3
+    participant LLM as Groq Llama 3 LLM
     participant DB as MongoDB
 
     U->>FE: Tap "Start Conversation"
@@ -121,7 +121,7 @@ sequenceDiagram
     WS->>FE: Store full text, wait for TTS
     BE->>DB: Save assistant message
 
-    Note over BE: Generate TTS (ElevenLabs / gTTS)
+    Note over BE: Generate TTS (Deepgram Aura)
     BE->>WS: { type: tts_audio, audio: base64_mp3 }
     WS->>FE: Play audio + reveal words one-by-one
     Note over FE: 🔊 Assistant speaks, words appear in sync
@@ -197,10 +197,10 @@ flowchart LR
     EOS --> WS
     WS --> SRV["FastAPI<br/>Server"]
     SRV -->|"pcm_to_wav()"| WAV["WAV container"]
-    WAV --> WHISPER["Groq Whisper<br/>Large v3"]
+    WAV --> WHISPER["Deepgram Nova-3"]
     WHISPER --> FILTER["Hallucination<br/>Filter"]
     FILTER --> TXT["Transcript text"]
-    SRV -->|"After LLM response"| TTS_GEN["ElevenLabs<br/>TTS"]
+    SRV -->|"After LLM response"| TTS_GEN["Deepgram Aura<br/>TTS"]
     TTS_GEN -->|"Base64 MP3"| WS2["tts_audio→Client"]
     WS2 --> PLAY["🔊 Playback<br/>+ Word Reveal"]
 
@@ -350,8 +350,8 @@ erDiagram
 │                     BACKEND (FastAPI + WebSocket)                       │
 │                                                                        │
 │  ┌──────────────┐   ┌──────────────────┐   ┌────────────────┐         │
-│  │  WS Handler  │──>│  Audio Buffer    │──>│  Groq Whisper   │         │
-│  │  (main.py)   │   │  (bytearray)     │   │  STT            │         │
+│  │  WS Handler  │──>│  Audio Buffer    │──>│  Deepgram       │         │
+│  │  (main.py)   │   │  (bytearray)     │   │  Nova-3 STT     │         │
 │  └──────┬───────┘   └──────────────────┘   └───────┬────────┘         │
 │         │                                           │                  │
 │         │  periodic (every ~2s)                     ▼                  │
@@ -369,9 +369,9 @@ erDiagram
 │         │                  │  │ Validation  │  │                        │
 │         │                  │  └────────────┘  │                        │
 │         │                  │  ┌────────────┐  │                        │
-│         │                  │  │ Gemini LLM  │  │                        │
-│         │                  │  │ + Tool Call  │  │                        │
-│         │                  │  └─────┬──────┘  │                        │
+│         │                  │  │ Groq Llama  │  │                        │
+│         │                  │  │ 3.3 70B     │  │                        │
+│         │                  │  │ + Tool Call │  │                        │
 │         │                  └────────┼─────────┘                        │
 │         │                           │                                  │
 │         │                           ▼                                  │
@@ -393,8 +393,7 @@ erDiagram
 │         │                                                              │
 │         │      ┌──────────────────────────┐                            │
 │         │──────│  TTS Generation          │                            │
-│         │      │  ElevenLabs (primary)    │                            │
-│         │      │  gTTS (fallback)         │                            │
+│         │      │  Deepgram Aura           │                            │
 │         │      └──────────┬───────────────┘                            │
 │         │<──── tts_audio (base64 MP3)                                  │
 │         │<──── tts_error (on failure)                                  │
@@ -435,6 +434,7 @@ erDiagram
 | `assistant_done` | `{ "type": "assistant_done", "text": "full response" }` | LLM response complete (includes full text) |
 | `tts_audio` | `{ "type": "tts_audio", "audio": "base64..." }` | TTS MP3 audio for playback |
 | `tts_error` | `{ "type": "tts_error", "message": "..." }` | TTS generation failed |
+| `latency` | `{ "type": "latency", "stt_ms": N, "llm_first_token_ms": N, "llm_total_ms": N, "tts_ms": N, "total_ms": N, "audio_duration_s": N }` | Per-stage pipeline latency metrics |
 | `error` | `{ "type": "error", "message": "..." }` | Error notification |
 
 ---
@@ -461,7 +461,7 @@ erDiagram
 7.  Server → Client:  { "type": "final_transcript",
                          "text": "What appointments are available tomorrow?" }
 
-8.  Server calls Gemini → tool call: check_available_slots("2026-03-06")
+8.  Server calls Groq Llama 3 → tool call: check_available_slots("2026-03-06")
     → executes tool → feeds result back → streams final response
 
 9.  Server → Client:  { "type": "assistant_stream", "text": "Here are the " }
@@ -470,7 +470,7 @@ erDiagram
 
 10. Server → Client:  { "type": "assistant_done", "text": "Here are the available slots for tomorrow..." }
 
-11. Server generates TTS audio (ElevenLabs)
+11. Server generates TTS audio (Deepgram Aura)
     Server → Client:  { "type": "tts_audio", "audio": "base64..." }
 
 12. Frontend plays MP3 audio, words appear one-by-one in chat bubble (🔊 icon)
@@ -591,9 +591,11 @@ The frontend uses **energy-based Voice Activity Detection** in the AudioWorklet:
 ### Environment Variables (`.env`)
 ```env
 MONGO_URI=mongodb://localhost:27017
-GOOGLE_API_KEY=your-gemini-api-key
 GROQ_API_KEY=your-groq-api-key
-ELEVEN_API_KEY=your-elevenlabs-api-key
+DEEPGRAM_API_KEY=your-deepgram-api-key
+# Optional (commented-out providers in code):
+# GOOGLE_API_KEY=your-gemini-api-key
+# ELEVEN_API_KEY=your-elevenlabs-api-key
 ```
 
 ### Backend
@@ -623,8 +625,8 @@ Open **http://localhost:5173** → click **Start Conversation** → speak.
 | Frontend | React 18, Vite, Tailwind CSS 4, AudioWorklet API |
 | WebSocket | Native WebSocket (browser) ↔ FastAPI WebSocket |
 | Backend | FastAPI (Python), asyncio |
-| STT | Groq Whisper Large v3 |
-| LLM | Google Gemini 2.5 Flash (with function calling) |
-| TTS | ElevenLabs (fallback: gTTS) |
+| STT | Deepgram Nova-3 (REST via httpx) |
+| LLM | Groq Llama 3.3 70B Versatile (with JSON-schema function calling) |
+| TTS | Deepgram Aura (aura-asteria-en, MP3) |
 | Database | MongoDB (pymongo) |
 | Voice capture | Web Audio API → AudioWorklet → PCM-16 @ 16 kHz |

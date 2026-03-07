@@ -1,6 +1,6 @@
 # SmileCare Dental Clinic – AI Voice Assistant
 
-A real-time, voice-first AI receptionist for a dental clinic. Patients speak naturally into their browser; the system transcribes speech via Groq Whisper, reasons and executes clinic operations through Gemini function-calling, and streams text responses back — all over a single WebSocket connection.
+A real-time, voice-first AI receptionist for a dental clinic. Patients speak naturally into their browser; the system transcribes speech via **Deepgram Nova-3**, reasons and executes clinic operations through **Groq Llama 3.3 70B** function-calling, and speaks back via **Deepgram Aura TTS** — all over a single WebSocket connection with per-stage latency measurement.
 
 ---
 
@@ -32,10 +32,10 @@ graph TB
 
   subgraph Server ["FastAPI Backend"]
     WS["WebSocket<br/>/ws/voice"]
-    STT["Groq Whisper<br/>Large v3"]
+    STT["Deepgram Nova-3<br/>STT"]
     AGENT["SmileCare Agent"]
-    LLM["Gemini 2.5 Flash<br/>Function Calling"]
-    TTS["ElevenLabs / gTTS"]
+    LLM["Groq Llama 3.3 70B<br/>Function Calling"]
+    TTS["Deepgram Aura<br/>TTS"]
   end
 
   subgraph DB ["MongoDB"]
@@ -68,9 +68,9 @@ graph TB
 |-------|-----------|------|
 | **Frontend** | React 18 + Vite + Tailwind CSS 4 | SPA with AudioWorklet voice capture |
 | **Backend** | FastAPI (Python 3.11+) | WebSocket server, REST API, routing |
-| **LLM** | Google Gemini 2.5 Flash | Conversational AI with native function calling |
-| **STT** | Groq Whisper Large v3 | Real-time speech-to-text |
-| **TTS** | ElevenLabs (primary) / gTTS (fallback) | Text-to-speech |
+| **LLM** | Groq Llama 3.3 70B Versatile | Conversational AI with JSON-schema function calling |
+| **STT** | Deepgram Nova-3 | Real-time speech-to-text (REST via httpx) |
+| **TTS** | Deepgram Aura (aura-asteria-en) | Text-to-speech (REST via httpx, MP3) |
 | **Database** | MongoDB (pymongo) | 7 collections for full dental clinic data |
 | **Audio** | Web AudioWorklet API | Low-latency 16 kHz PCM capture + VAD |
 
@@ -98,9 +98,9 @@ sequenceDiagram
 
   Note over C: VAD detects 2.5 s silence
   C->>S: {"type": "end_of_speech"}
-  S->>S: Final STT (full buffer → Whisper)
+  S->>S: Final STT (full buffer → Deepgram Nova-3)
   S->>C: {"type": "final_transcript", "text": "..."}
-  S->>S: Gemini + tool calling
+  S->>S: Groq Llama 3 + tool calling
   loop Streaming response
     S->>C: {"type": "assistant_stream", "text": "chunk"}
   end
@@ -130,13 +130,14 @@ sequenceDiagram
 | Server → Client | `assistant_done` | `text` | Full response delivered |
 | Server → Client | `tts_audio` | `audio` (base64) | MP3 audio for playback |
 | Server → Client | `tts_error` | `message` | TTS generation failed |
+| Server → Client | `latency` | `stt_ms`, `llm_first_token_ms`, `llm_total_ms`, `tts_ms`, `total_ms`, `audio_duration_s` | Per-stage pipeline latency metrics |
 | Server → Client | `error` | `message` | Error description |
 
 ---
 
 ## Agent & Tool Calling
 
-The agent (`SmileCare AI`) enforces a **dental-only scope** — any off-topic question is politely declined. When a user request maps to a clinic action, Gemini invokes one of 8 registered tools:
+The agent (`SmileCare AI`) enforces a **dental-only scope** — any off-topic question is politely declined. When a user request maps to a clinic action, Groq Llama 3.3 invokes one of 8 registered tools:
 
 ```mermaid
 flowchart TD
@@ -164,7 +165,7 @@ flowchart TD
 | `get_patient_appointments` | Look up patient bookings | `patient_phone` |
 | `get_dentists` | List dentists (optionally by specialization) | — |
 
-The tool-calling loop runs up to **3 rounds** (non-streaming) to resolve chained tool calls, then the final answer is **streamed** to the client via `generate_content_stream`.
+The tool-calling loop runs up to **3 rounds** (non-streaming) to resolve chained tool calls, then the final answer is **streamed** to the client with `tool_choice="none"` to ensure a plain text response.
 
 ---
 
@@ -177,7 +178,7 @@ flowchart LR
   BUF -->|"Float32→Int16"| PCM["PCM-16 LE bytes"]
   PCM -->|"ws.send(binary)"| SRV["FastAPI<br/>audio_buffer"]
   SRV -->|"pcm_to_wav()"| WAV["In-memory WAV"]
-  WAV -->|"Groq API"| TXT["Transcript"]
+  WAV -->|"Deepgram API"| TXT["Transcript"]
 ```
 
 ### VAD (Voice Activity Detection)
@@ -286,8 +287,8 @@ demo/
 │   │   └── clinic.py            # REST CRUD: /appointments, /services, /dentists, /dashboard
 │   └── services/
 │       ├── agent_service.py     # SmileCare AI agent, tool handlers, dental scope validation
-│       ├── llm_service.py       # Gemini client, 8 FunctionDeclarations, streaming generator
-│       └── voice_service.py     # Groq Whisper STT, ElevenLabs/gTTS TTS, pcm_to_wav
+│       ├── llm_service.py       # Groq Llama 3 client, 8 JSON-schema tools, streaming generator
+│       └── voice_service.py     # Deepgram Nova-3 STT, Deepgram Aura TTS, pcm_to_wav
 ├── frontend/
 │   ├── index.html
 │   ├── package.json             # React 18, Vite, Tailwind CSS 4
@@ -300,9 +301,9 @@ demo/
 │       └── index.css            # Tailwind imports
 ├── audio/                       # Generated TTS audio files (gitignored)
 ├── docs/
+│   ├── ARCHITECTURE.md          # Detailed architecture docs with Mermaid diagrams
 │   └── VAD_IMPROVEMENTS.md      # Detailed VAD & TTS documentation
 ├── requirements.txt             # Python dependencies
-├── ARCHITECTURE.md              # Detailed architecture docs with Mermaid diagrams
 └── .env                         # API keys (not committed)
 ```
 
@@ -336,10 +337,12 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 
 ```env
-GOOGLE_API_KEY=your_gemini_api_key
 GROQ_API_KEY=your_groq_api_key
-ELEVEN_API_KEY=your_elevenlabs_api_key
+DEEPGRAM_API_KEY=your_deepgram_api_key
 MONGO_URI=mongodb://localhost:27017
+# Optional (commented-out providers in code):
+# GOOGLE_API_KEY=your_gemini_api_key
+# ELEVEN_API_KEY=your_elevenlabs_api_key
 ```
 
 ### 3. Start the backend
@@ -367,7 +370,8 @@ The frontend runs at `http://localhost:5173` and connects to the backend at `htt
 5. The assistant responds with **voice (TTS)** — words appear one-by-one as it speaks
 6. **Interrupt anytime** — speak while the assistant is talking to stop it and take over
 7. Click **"Stop Conversation"** when done
-8. Use the **debug panel** (bottom-right toggle) to monitor VAD events in real time
+8. Use the **debug panel** (bottom-right toggle) to monitor VAD events and **pipeline latency** in real time
+9. Use the **floating info button** (bottom-right) to view clinic details, services, and dentists
 
 ---
 
@@ -375,10 +379,11 @@ The frontend runs at `http://localhost:5173` and connects to the backend at `htt
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GOOGLE_API_KEY` | Yes | Google Gemini API key |
-| `GROQ_API_KEY` | Yes | Groq API key for Whisper STT |
-| `ELEVEN_API_KEY` | No | ElevenLabs API key (falls back to gTTS) |
+| `GROQ_API_KEY` | Yes | Groq API key (Llama 3.3 70B LLM) |
+| `DEEPGRAM_API_KEY` | Yes | Deepgram API key (Nova-3 STT + Aura TTS) |
 | `MONGO_URI` | Yes | MongoDB connection string |
+| `GOOGLE_API_KEY` | No | Google Gemini API key (commented-out provider) |
+| `ELEVEN_API_KEY` | No | ElevenLabs API key (commented-out provider) |
 
 ---
 

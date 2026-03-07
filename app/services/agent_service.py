@@ -1,6 +1,8 @@
 """
 Dental Clinic AI Agent – validates queries are dental-related, executes
-tool calls (appointments, services, etc.), and streams responses via Gemini.
+tool calls (appointments, services, etc.), and streams responses.
+
+Active LLM: Groq Llama 3 (via llm_service).
 
 Exposes:
   process_message(text)                → str   (sync, non-streaming)
@@ -12,8 +14,8 @@ import os
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 
-from google import genai
-from google.genai import types
+# from google import genai          # Uncomment for Gemini backend
+# from google.genai import types     # Uncomment for Gemini backend
 from dotenv import load_dotenv
 
 from app.database import (
@@ -260,19 +262,15 @@ _TOOL_HANDLERS = {
 # ── Public API ───────────────────────────────────────────────
 
 def _build_contents(user_message: str, history: list | None = None) -> list:
-    """Build Gemini contents list from conversation history + new message."""
+    """Build message list from conversation history + new message."""
     contents = []
     if history:
         for msg in history:
-            contents.append(
-                types.Content(
-                    role="user" if msg["role"] == "user" else "model",
-                    parts=[types.Part(text=msg["content"])],
-                )
-            )
-    contents.append(
-        types.Content(role="user", parts=[types.Part(text=user_message)])
-    )
+            contents.append({
+                "role": msg["role"] if msg["role"] in ("user", "assistant") else "user",
+                "content": msg["content"],
+            })
+    contents.append({"role": "user", "content": user_message})
     return contents
 
 
